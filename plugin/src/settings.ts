@@ -4,6 +4,7 @@ import { SharingSection } from "./sharing-ui";
 import { DeviceSetupModal } from "./device-modals";
 import { DevicePickerModal } from "./device-picker";
 import { SamsynApi } from "./api";
+import { formatBytes } from "./format";
 
 /** A share mounted straight from the owner's server with a ticket (no server of our own). */
 export interface GuestMount {
@@ -439,7 +440,7 @@ export class SamsynSettingTab extends PluginSettingTab {
     line("Status", statusText[d.status] ?? d.status, d.status === "connected" ? "is-ok" : d.status === "offline" ? "is-bad" : "");
     line("Initial sync", d.synced ? "done" : "pending");
     line("Other devices", String(d.peers));
-    line("Synced files", `${d.textFiles} text, ${d.blobFiles} other`);
+    line("Synced files", `${d.textFiles} text, ${d.blobFiles} other · ${formatBytes(d.textBytes + d.blobBytes)}`);
     line("WebSocket", d.wsUrl || "–");
     if (d.lastConnectedAt) line("Last connected", new Date(d.lastConnectedAt).toLocaleTimeString());
     if (d.lastError) line("Last error", d.lastError, "is-bad");
@@ -448,11 +449,10 @@ export class SamsynSettingTab extends PluginSettingTab {
     line("Install id", d.installId);
     void this.plugin.engine?.refreshStorage();
     if (d.storage) {
-      const mb = (n: number) => `${(n / 1_048_576).toFixed(n < 10_485_760 ? 1 : 0)} MB`;
       const where = d.storage.backend === "indexeddb" ? "IndexedDB" : "files in plugin folder";
-      let txt = `${where} · document ${mb(d.storage.docBytes)} · ${d.storage.syncedEntries} entries`;
+      let txt = `${where} · document ${formatBytes(d.storage.docBytes)} · ${d.storage.syncedEntries} entries`;
       if (d.storage.usageBytes !== null && d.storage.quotaBytes) {
-        txt += ` · ${mb(d.storage.usageBytes)} of ${mb(d.storage.quotaBytes)} used`;
+        txt += ` · ${formatBytes(d.storage.usageBytes)} of ${formatBytes(d.storage.quotaBytes)} used`;
       }
       line("Local cache", txt, d.storage.docBytes > 100 * 1_048_576 ? "is-warn" : "");
     }

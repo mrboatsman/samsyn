@@ -4,6 +4,7 @@ import { SetupConfirmModal } from "./device-modals";
 import { ConfigSync } from "./config-sync";
 import { BlobClient } from "./blobs";
 import { SyncEngine, EngineStatus, EngineTarget } from "./engine";
+import { formatBytes } from "./format";
 import { Persistence, deviceInstallId } from "./persistence";
 import { MountModal, ShareModal } from "./sharing-modals";
 import { DEFAULT_SETTINGS, GuestMount, SamsynSettingTab, SamsynSettings, randomSuffix, serverUrls, slugify } from "./settings";
@@ -114,7 +115,7 @@ export default class SamsynPlugin extends Plugin {
         }
         const lines: string[] = [];
         for (const d of diags) {
-          lines.push(`${d.kind === "home" ? "Vault" : d.label}: ${d.status}${d.synced ? ", synced" : ""}, ${d.peers} other(s), ${d.textFiles} text + ${d.blobFiles} other files`);
+          lines.push(`${d.kind === "home" ? "Vault" : d.label}: ${d.status}${d.synced ? ", synced" : ""}, ${d.peers} other(s), ${d.textFiles} text + ${d.blobFiles} other files (${formatBytes(d.textBytes + d.blobBytes)})`);
           if (d.lastError) lines.push(`  error: ${d.lastError}`);
           if (d.hint) lines.push(`  ${d.hint}`);
           if (d.pendingDeletions > 0) lines.push(`  ${d.pendingDeletions} deletions held back by the safety guard`);

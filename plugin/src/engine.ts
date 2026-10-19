@@ -3,6 +3,7 @@ import * as Y from "yjs";
 import { WebsocketProvider } from "y-websocket";
 import { BlobClient } from "./blobs";
 import { diffText } from "./diff";
+import { utf8Length } from "./format";
 import { hashText, sha256Hex } from "./hash";
 import { isSafeKey } from "./keys";
 import { LocalState, Persistence, StorageInfo, deviceInstallId } from "./persistence";
@@ -71,6 +72,10 @@ export interface Diagnostics {
   peers: number;
   textFiles: number;
   blobFiles: number;
+  /** UTF-8 size of all synced text files, in bytes. */
+  textBytes: number;
+  /** Size of all synced attachments, in bytes (from their metadata). */
+  blobBytes: number;
   lastError: string | null;
   lastConnectedAt: number | null;
   hint: string | null;
@@ -267,6 +272,10 @@ export class SyncEngine {
   }
 
   getDiagnostics(): Diagnostics {
+    let textBytes = 0;
+    for (const t of this.texts.values()) textBytes += utf8Length(t.toString());
+    let blobBytes = 0;
+    for (const b of this.blobs.values()) blobBytes += b.size || 0;
     return {
       kind: this.target.kind,
       label: this.target.label,
@@ -278,6 +287,8 @@ export class SyncEngine {
       peers: this.provider ? Math.max(0, this.provider.awareness.getStates().size - 1) : 0,
       textFiles: this.texts.size,
       blobFiles: this.blobs.size,
+      textBytes,
+      blobBytes,
       lastError: this.lastError,
       lastConnectedAt: this.lastConnectedAt,
       hint: this.hint,
