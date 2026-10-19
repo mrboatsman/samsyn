@@ -48,6 +48,12 @@ export interface SharingInfo {
   shares: ShareRow[];
   mounts: MountRow[];
 }
+export interface Health {
+  ok: boolean;
+  /** The server's release version, e.g. "0.3.0", "0.3.0-beta.2" or "0.3.0+1a2b3c4" from main. */
+  version: string;
+  node_id: string;
+}
 
 /** Thin client for the server's sharing API. Everything else in the plugin is plain y-websocket. */
 export class SamsynApi {
@@ -57,6 +63,11 @@ export class SamsynApi {
     const u = serverUrls(this.settings.serverUrl);
     if (!u) throw new Error("no server URL configured");
     return u.http;
+  }
+
+  /** Unauthenticated liveness and version check. */
+  health(): Promise<Health> {
+    return this.call<Health>("GET", "/health");
   }
 
   private async call<T>(method: string, path: string, body?: unknown): Promise<T> {

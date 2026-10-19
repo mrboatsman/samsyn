@@ -113,7 +113,7 @@ export default class SamsynPlugin extends Plugin {
           new Notice("Samsyn: not running");
           return;
         }
-        const lines: string[] = [];
+        const lines: string[] = [`Samsyn plugin ${this.manifest.version}`];
         for (const d of diags) {
           lines.push(`${d.kind === "home" ? "Vault" : d.label}: ${d.status}${d.synced ? ", synced" : ""}, ${d.peers} other(s), ${d.textFiles} text + ${d.blobFiles} other files (${formatBytes(d.textBytes + d.blobBytes)})`);
           if (d.lastError) lines.push(`  error: ${d.lastError}`);

@@ -93,6 +93,8 @@ const TABS: Array<{ id: SettingsTabName; label: string }> = [
 export class SamsynSettingTab extends PluginSettingTab {
   private statusTimer: ReturnType<typeof setInterval> | null = null;
   private restartTimer: ReturnType<typeof setTimeout> | null = null;
+  /** What the server last said in /health; an error string when it could not be reached. */
+  private serverVersion: { version: string } | { error: string } | null = null;
   private sharing: SharingSection | null = null;
   private active: SettingsTabName = "server";
 
@@ -181,6 +183,7 @@ export class SamsynSettingTab extends PluginSettingTab {
     const statusEl = containerEl.createDiv({ cls: "samsyn-diag" });
     this.renderStatus(statusEl);
     this.statusTimer = setInterval(() => this.renderStatus(statusEl), 2000);
+    void this.refreshServerVersion(statusEl);
 
     new Setting(containerEl).setName("Connection").setHeading();
 
@@ -258,6 +261,7 @@ export class SamsynSettingTab extends PluginSettingTab {
             if (res.status === 200) new Notice(`Samsyn: server OK, token valid for user "${res.json?.user ?? "?"}"`);
             else if (res.status === 401) new Notice("Samsyn: server reachable but token rejected");
             else new Notice(`Samsyn: server responded ${res.status}`);
+            void this.refreshServerVersion(statusEl);
           } catch (e) {
             new Notice(`Samsyn: cannot reach server (${(e as Error).message})`);
           }
@@ -438,8 +442,52 @@ export class SamsynSettingTab extends PluginSettingTab {
     }
   }
 
+  /** Ask the server for its version and redraw the status panel with the answer. */
+  private async refreshServerVersion(statusEl: HTMLElement): Promise<void> {
+    const s = this.plugin.settings;
+    if (!serverUrls(s.serverUrl)) {
+      this.serverVersion = null;
+      return;
+    }
+    try {
+      const h = await new SamsynApi(s).health();
+      this.serverVersion = { version: h.version || "unknown" };
+    } catch (e) {
+      this.serverVersion = { error: (e as Error).message };
+    }
+    if (statusEl.isConnected) this.renderStatus(statusEl);
+  }
+
+  /** "plugin 0.3.0 · server 0.3.0", flagged when the two are from different releases. */
+  private versionLine(): { text: string; cls: string } {
+    const plugin = this.plugin.manifest.version;
+    let text = `plugin ${plugin}`;
+    let cls = "";
+    const sv = this.serverVersion;
+    if (sv && "version" in sv) {
+      text += ` · server ${sv.version}`;
+      if (releaseOf(sv.version) !== releaseOf(plugin)) {
+        text += " (different releases; update the older one)";
+        cls = "is-warn";
+      }
+    } else if (sv) {
+      text += ` · server unreachable (${sv.error})`;
+      cls = "is-warn";
+    } else if (serverUrls(this.plugin.settings.serverUrl)) {
+      text += " · server …";
+    }
+    return { text, cls };
+  }
+
   private renderStatus(el: HTMLElement): void {
     el.empty();
+    const line = (label: string, value: string, cls?: string) => {
+      const row = el.createDiv({ cls: "samsyn-diag-row" });
+      row.createSpan({ cls: "samsyn-diag-label", text: label });
+      row.createSpan({ cls: "samsyn-diag-value" + (cls ? " " + cls : ""), text: value });
+    };
+    const version = this.versionLine();
+    line("Version", version.text, version.cls);
     const d = this.plugin.engine?.getDiagnostics();
     if (!d) {
       const guests = this.plugin.settings.guestMounts.length;
@@ -452,11 +500,6 @@ export class SamsynSettingTab extends PluginSettingTab {
       });
       return;
     }
-    const line = (label: string, value: string, cls?: string) => {
-      const row = el.createDiv({ cls: "samsyn-diag-row" });
-      row.createSpan({ cls: "samsyn-diag-label", text: label });
-      row.createSpan({ cls: "samsyn-diag-value" + (cls ? " " + cls : ""), text: value });
-    };
     const statusText: Record<string, string> = {
       connected: "Connected, live",
       connecting: "Connecting…",
@@ -545,4 +588,9 @@ export class SamsynSettingTab extends PluginSettingTab {
           }),
       );
   }
+}
+
+/** "0.3.0" for "0.3.0", "0.3.0-beta.2" and "0.3.0+1a2b3c4": the release a version belongs to. */
+function releaseOf(version: string): string {
+  return version.split(/[-+]/)[0];
 }
