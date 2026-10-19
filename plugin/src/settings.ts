@@ -290,7 +290,7 @@ export class SamsynSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Exclude paths")
-      .setDesc("Comma separated folder or file prefixes to skip, e.g. Private/, Scratch.md")
+      .setDesc("Comma separated folders or files to skip, e.g. Private/, Scratch.md")
       .addText((t) =>
         t.setValue(s.excludePaths).onChange(async (v) => {
           s.excludePaths = v;

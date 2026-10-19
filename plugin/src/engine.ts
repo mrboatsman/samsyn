@@ -380,9 +380,7 @@ export class SyncEngine {
       return key || null;
     }
     for (const r of excludeRoots) if (vaultPath.startsWith(r)) return null;
-    if (this.excludes.some((e) => vaultPath === e || vaultPath.startsWith(e.endsWith("/") ? e : e + "/") || vaultPath.startsWith(e))) {
-      return null;
-    }
+    if (this.excludes.some((e) => vaultPath === e || vaultPath.startsWith(e.endsWith("/") ? e : e + "/"))) return null;
     return vaultPath;
   }
 
