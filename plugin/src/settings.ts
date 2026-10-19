@@ -92,6 +92,7 @@ const TABS: Array<{ id: SettingsTabName; label: string }> = [
 
 export class SamsynSettingTab extends PluginSettingTab {
   private statusTimer: ReturnType<typeof setInterval> | null = null;
+  private restartTimer: ReturnType<typeof setTimeout> | null = null;
   private sharing: SharingSection | null = null;
   private active: SettingsTabName = "server";
 
@@ -115,9 +116,28 @@ export class SamsynSettingTab extends PluginSettingTab {
     this.clearTimers();
   }
 
+  /**
+   * What the engine syncs (extensions, attachments, excludes) is fixed when it is built, so a
+   * change needs a restart, which also runs the reconcile that pushes or pulls the newly
+   * included files. Text fields fire per keystroke; wait for typing to stop.
+   */
+  private scheduleRestart(): void {
+    if (this.restartTimer) clearTimeout(this.restartTimer);
+    this.restartTimer = setTimeout(() => {
+      this.restartTimer = null;
+      void this.plugin.restartEngine();
+    }, 1500);
+  }
+
   private clearTimers(): void {
     if (this.statusTimer) clearInterval(this.statusTimer);
     this.statusTimer = null;
+    if (this.restartTimer) {
+      // The tab closed before the debounce fired: apply the pending scope change now.
+      clearTimeout(this.restartTimer);
+      this.restartTimer = null;
+      void this.plugin.restartEngine();
+    }
     this.sharing?.stop();
     this.sharing = null;
   }
@@ -272,6 +292,7 @@ export class SamsynSettingTab extends PluginSettingTab {
         t.setValue(s.textExtensions).onChange(async (v) => {
           s.textExtensions = v;
           await this.plugin.saveSettings();
+          this.scheduleRestart();
         }),
       );
 
@@ -285,6 +306,7 @@ export class SamsynSettingTab extends PluginSettingTab {
         t.setValue(s.syncBinary).onChange(async (v) => {
           s.syncBinary = v;
           await this.plugin.saveSettings();
+          await this.plugin.restartEngine();
         }),
       );
 
@@ -295,6 +317,7 @@ export class SamsynSettingTab extends PluginSettingTab {
         t.setValue(s.excludePaths).onChange(async (v) => {
           s.excludePaths = v;
           await this.plugin.saveSettings();
+          this.scheduleRestart();
         }),
       );
   }
