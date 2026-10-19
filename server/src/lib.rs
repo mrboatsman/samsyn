@@ -10,6 +10,14 @@
 //! - [`client`]: the headless sync client.
 //! - [`config`], [`cli`]: command-line surface.
 
+/// The version this build reports (`/health`, `--version`). Releases stamp it into
+/// Cargo.toml; Docker builds of untagged commits and betas pass `SAMSYN_VERSION` instead
+/// (see server/Dockerfile and .github/workflows/docker.yml).
+pub const VERSION: &str = match option_env!("SAMSYN_VERSION") {
+    Some(v) if !v.is_empty() => v,
+    _ => env!("CARGO_PKG_VERSION"),
+};
+
 pub mod access;
 pub mod account;
 pub mod app;

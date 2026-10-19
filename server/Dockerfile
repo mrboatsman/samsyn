@@ -7,6 +7,10 @@ COPY server/Cargo.toml server/Cargo.lock server/
 COPY server/src server/src
 COPY third_party third_party
 WORKDIR /src/server
+# Version reported by /health and --version. Tagged builds pass the tag; unset falls
+# back to Cargo.toml (which releases keep in step with manifest.json).
+ARG SAMSYN_VERSION=
+ENV SAMSYN_VERSION=$SAMSYN_VERSION
 RUN cargo build --release --bin samsyn
 
 FROM debian:bookworm-slim

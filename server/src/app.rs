@@ -285,7 +285,7 @@ async fn health(State(state): State<SharedState>) -> (StatusCode, Json<serde_jso
         StatusCode::OK,
         Json(serde_json::json!({
             "ok": true,
-            "version": env!("CARGO_PKG_VERSION"),
+            "version": crate::VERSION,
             "vaults_loaded": state.docs.loaded_count(),
             "node_id": state.docs.node_id,
         })),

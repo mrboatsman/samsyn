@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { nextVersion, bumpBase, format, compare, applyVersion, checkConsistency } from "./version.mjs";
+import { nextVersion, bumpBase, format, compare, applyVersion, checkConsistency, setCargoVersion, setCargoLockVersion } from "./version.mjs";
 
 const next = (cur, channel, level, base) => nextVersion(cur, { channel, level, base });
 
@@ -65,10 +65,20 @@ test("applyVersion writes every carrier; versions.json only for stable", () => {
   w("versions.json", { "0.1.0": "1.5.0" });
   w("plugin/package.json", { name: "samsyn", version: "0.1.0" });
   w("plugin/package-lock.json", { name: "samsyn", version: "0.1.0", packages: { "": { name: "samsyn", version: "0.1.0" } } });
+  fs.mkdirSync(path.join(root, "server"));
+  const cargo = '[package]\nname = "samsyn-server"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\nserde = { version = "1.0" }\n';
+  const lock = '[[package]]\nname = "other"\nversion = "0.1.0"\n\n[[package]]\nname = "samsyn-server"\nversion = "0.1.0"\ndependencies = []\n';
+  fs.writeFileSync(path.join(root, "server/Cargo.toml"), cargo);
+  fs.writeFileSync(path.join(root, "server/Cargo.lock"), lock);
 
   applyVersion("0.2.0-beta.1", root);
   const r = (p) => JSON.parse(fs.readFileSync(path.join(root, p), "utf8"));
+  const t = (p) => fs.readFileSync(path.join(root, p), "utf8");
   assert.equal(r("manifest.json").version, "0.2.0-beta.1");
+  assert.match(t("server/Cargo.toml"), /^version = "0\.2\.0-beta\.1"$/m);
+  assert.match(t("server/Cargo.toml"), /serde = \{ version = "1\.0" \}/, "dependency versions untouched");
+  assert.match(t("server/Cargo.lock"), /name = "samsyn-server"\nversion = "0\.2\.0-beta\.1"/);
+  assert.match(t("server/Cargo.lock"), /name = "other"\nversion = "0\.1\.0"/, "other lock entries untouched");
   assert.equal(r("plugin/package.json").version, "0.2.0-beta.1");
   assert.equal(r("plugin/package-lock.json").packages[""].version, "0.2.0-beta.1");
   assert.deepEqual(r("versions.json"), { "0.1.0": "1.5.0" });
@@ -80,4 +90,13 @@ test("applyVersion writes every carrier; versions.json only for stable", () => {
 
   w("plugin/package.json", { name: "samsyn", version: "0.1.0" });
   assert.match(checkConsistency(root)[0], /package\.json has 0\.1\.0/);
+  fs.writeFileSync(path.join(root, "server/Cargo.toml"), cargo);
+  assert.ok(checkConsistency(root).some((p) => /Cargo\.toml has 0\.1\.0/.test(p)));
+});
+
+test("cargo version rewrites only the package entry", () => {
+  const toml = '[package]\nname = "x"\nversion = "0.1.0"\n\n[dependencies]\ny = { version = "0.1.0" }\n';
+  assert.equal(setCargoVersion(toml, "1.2.3"), '[package]\nname = "x"\nversion = "1.2.3"\n\n[dependencies]\ny = { version = "0.1.0" }\n');
+  assert.throws(() => setCargoVersion('[dependencies]\ny = "1"\n', "1.0.0"));
+  assert.throws(() => setCargoLockVersion('[[package]]\nname = "y"\nversion = "1"\n', "1.0.0"));
 });

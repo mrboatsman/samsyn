@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-// Release version tooling. Single source of truth for the plugin version is
+// Release version tooling. Single source of truth for the version is
 // /manifest.json; this script computes the next version and writes it to every
-// file that carries it. See docs/DEVELOPMENT.md "Releasing".
+// file that carries it, plugin and server alike. See docs/DEVELOPMENT.md "Releasing".
 //
 //   node scripts/version.mjs current
 //   node scripts/version.mjs next --channel beta|stable --level auto|patch|minor|major|none [--base X.Y.Z] [--current-untagged]
@@ -138,6 +138,18 @@ export function applyVersion(version, root = ROOT) {
     touched.push("plugin/package-lock.json");
   }
 
+  // The server reports CARGO_PKG_VERSION from /health and --version; keep it in step.
+  const cargoPath = path.join(root, "server", "Cargo.toml");
+  if (fs.existsSync(cargoPath)) {
+    fs.writeFileSync(cargoPath, setCargoVersion(fs.readFileSync(cargoPath, "utf8"), format(v)));
+    touched.push("server/Cargo.toml");
+    const cargoLockPath = path.join(root, "server", "Cargo.lock");
+    if (fs.existsSync(cargoLockPath)) {
+      fs.writeFileSync(cargoLockPath, setCargoLockVersion(fs.readFileSync(cargoLockPath, "utf8"), format(v)));
+      touched.push("server/Cargo.lock");
+    }
+  }
+
   if (v.pre === null) {
     const versionsPath = path.join(root, "versions.json");
     const versions = fs.existsSync(versionsPath) ? readJson(versionsPath) : {};
@@ -148,10 +160,39 @@ export function applyVersion(version, root = ROOT) {
   return touched;
 }
 
+const CARGO_PKG_VERSION = /^(\[package\][^[]*?^version = ")([^"]*)(")/ms;
+const CARGO_LOCK_VERSION = /^(name = "samsyn-server"\nversion = ")([^"]*)(")/m;
+
+/** Cargo.toml text with the [package] version replaced. Cargo accepts pre-release suffixes. */
+export function setCargoVersion(toml, version) {
+  if (!CARGO_PKG_VERSION.test(toml)) throw new Error("server/Cargo.toml: no [package] version found");
+  return toml.replace(CARGO_PKG_VERSION, `$1${version}$3`);
+}
+
+/** Cargo.lock text with the samsyn-server entry replaced, so `--locked` builds stay happy. */
+export function setCargoLockVersion(lock, version) {
+  if (!CARGO_LOCK_VERSION.test(lock)) throw new Error("server/Cargo.lock: no samsyn-server entry found");
+  return lock.replace(CARGO_LOCK_VERSION, `$1${version}$3`);
+}
+
+function cargoVersion(toml) {
+  return toml.match(CARGO_PKG_VERSION)?.[2] ?? null;
+}
+
 /** Every file that carries a version must agree with manifest.json. */
 export function checkConsistency(root = ROOT) {
   const v = currentVersion(root);
   const problems = [];
+  const cargoPath = path.join(root, "server", "Cargo.toml");
+  if (fs.existsSync(cargoPath)) {
+    const cv = cargoVersion(fs.readFileSync(cargoPath, "utf8"));
+    if (cv !== v) problems.push(`server/Cargo.toml has ${cv}, manifest.json has ${v}`);
+    const cargoLockPath = path.join(root, "server", "Cargo.lock");
+    if (fs.existsSync(cargoLockPath)) {
+      const lv = fs.readFileSync(cargoLockPath, "utf8").match(CARGO_LOCK_VERSION)?.[2] ?? null;
+      if (lv !== v) problems.push(`server/Cargo.lock has ${lv}, manifest.json has ${v}`);
+    }
+  }
   const pkg = readJson(path.join(root, "plugin", "package.json"));
   if (pkg.version !== v) problems.push(`plugin/package.json has ${pkg.version}, manifest.json has ${v}`);
   const lockPath = path.join(root, "plugin", "package-lock.json");

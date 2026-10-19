@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug, Clone)]
-#[command(name = "samsyn-server", version, about = "CRDT sync server for the Samsyn Obsidian plugin")]
+#[command(name = "samsyn-server", version = crate::VERSION, about = "CRDT sync server for the Samsyn Obsidian plugin")]
 pub struct Cli {
     /// Directory holding all server data (registry, vaults, blobs, snapshots).
     #[arg(long, global = true, env = "SAMSYN_DATA_DIR", default_value = "./data")]

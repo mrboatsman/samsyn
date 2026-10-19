@@ -109,6 +109,8 @@ jobs:
             versions.json
             plugin/package.json
             plugin/package-lock.json
+            server/Cargo.toml
+            server/Cargo.lock
             CHANGELOG.md
           commit-message: "chore(release): ${{ steps.next.outputs.version }}"
           title: "chore(release): ${{ steps.next.outputs.version }}"

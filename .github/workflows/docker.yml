@@ -36,6 +36,15 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
 
+      # What the server reports as its version: the tag for releases and betas, the
+      # repo version plus the commit for images built from main.
+      - name: Server version
+        id: ver
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then v="${GITHUB_REF_NAME#v}"
+          else v="$(node scripts/version.mjs current)+${GITHUB_SHA::7}"; fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
       - uses: docker/setup-buildx-action@v3
 
       # Build context is the repo root so the vendored third_party/yrs is included.
@@ -48,5 +57,6 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: SAMSYN_VERSION=${{ steps.ver.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
