@@ -277,7 +277,10 @@ export class SamsynSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Sync attachments and other files")
-      .setDesc("Images, PDFs and other non-text files. Last writer wins.")
+      .setDesc(
+        "Images, PDFs and other non-text files. Last writer wins. Files Obsidian does not show (.js, .css, .html, …) " +
+          "are picked up at startup and by \"Reconcile all files now\"; turn on Obsidian's \"Detect all file extensions\" to sync them live.",
+      )
       .addToggle((t) =>
         t.setValue(s.syncBinary).onChange(async (v) => {
           s.syncBinary = v;

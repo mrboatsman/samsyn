@@ -8,6 +8,7 @@ import { hashText, sha256Hex } from "./hash";
 import { isSafeKey } from "./keys";
 import { LocalState, Persistence, StorageInfo, deviceInstallId } from "./persistence";
 import { SamsynSettings } from "./settings";
+import { walkDisk } from "./walk";
 
 export interface BlobMeta {
   hash: string;
@@ -401,8 +402,49 @@ export class SyncEngine {
     return this.target.root + key;
   }
 
-  private fileOf(key: string): TAbstractFile | null {
-    return this.app.vault.getAbstractFileByPath(this.pathOf(key));
+  // ---------------------------------------------------------------- local disk
+  //
+  // Obsidian only indexes files with extensions it knows (plus everything created through
+  // its own API, and everything when "Detect all file extensions" is on). A .js, .css or
+  // .txt file copied into the vault from outside has no TFile and raises no vault events,
+  // but it is on disk and must sync. Reads therefore go through the adapter, which sees the
+  // real filesystem; writes and deletes prefer the vault API when a TFile exists (editors,
+  // metadata cache and the index stay right) and fall back to the adapter otherwise.
+
+  /** Doc keys of every file on disk in this engine's scope. */
+  private async scanLocal(): Promise<Set<string>> {
+    const keys = new Set<string>();
+    const consider = (vaultPath: string) => {
+      const key = this.keyOf(vaultPath);
+      if (key && this.shouldSync(key)) keys.add(key);
+    };
+    // The index first: anything it has is certainly meant to be a file of this vault.
+    for (const f of this.app.vault.getFiles()) consider(f.path);
+    for (const p of await this.listDisk(this.target.root)) consider(p);
+    return keys;
+  }
+
+  /** Vault paths of every file on disk under `dir`, pruned to this engine's scope. */
+  private async listDisk(dir: string): Promise<string[]> {
+    const paths = await walkDisk(this.app.vault.adapter, dir, (folder) => this.keyPrefixOf(folder) !== null);
+    return paths.map((p) => normalizePath(p));
+  }
+
+  private async localStat(key: string): Promise<{ mtime: number } | null> {
+    const stat = await this.app.vault.adapter.stat(this.pathOf(key)).catch(() => null);
+    return stat && stat.type === "file" ? { mtime: stat.mtime } : null;
+  }
+
+  /** Local text content, or null when the file is not on disk. */
+  private async readLocalText(key: string): Promise<string | null> {
+    if (!(await this.localStat(key))) return null;
+    return this.app.vault.adapter.read(this.pathOf(key));
+  }
+
+  /** Local bytes, or null when the file is not on disk. */
+  private async readLocalBinary(key: string): Promise<ArrayBuffer | null> {
+    if (!(await this.localStat(key))) return null;
+    return this.app.vault.adapter.readBinary(this.pathOf(key));
   }
 
   // ---------------------------------------------------------------- helpers
@@ -485,6 +527,11 @@ export class SyncEngine {
       if ((await this.app.vault.read(existing)) !== content) await this.app.vault.modify(existing, content);
       return;
     }
+    if (await this.app.vault.adapter.exists(path)) {
+      // On disk but not in Obsidian's index: write through the adapter.
+      if ((await this.app.vault.adapter.read(path)) !== content) await this.app.vault.adapter.write(path, content);
+      return;
+    }
     await this.ensureFolder(path);
     try {
       await this.app.vault.create(path, content);
@@ -492,6 +539,7 @@ export class SyncEngine {
       // Raced with another writer (observer vs reconcile); fall back to modify.
       const f = this.app.vault.getAbstractFileByPath(path);
       if (f instanceof TFile) await this.app.vault.modify(f, content);
+      else if (await this.app.vault.adapter.exists(path)) await this.app.vault.adapter.write(path, content);
       else throw e;
     }
   }
@@ -504,24 +552,36 @@ export class SyncEngine {
       await this.app.vault.modifyBinary(existing, data);
       return;
     }
+    if (await this.app.vault.adapter.exists(path)) {
+      await this.app.vault.adapter.writeBinary(path, data);
+      return;
+    }
     await this.ensureFolder(path);
     try {
       await this.app.vault.createBinary(path, data);
     } catch (e) {
       const f = this.app.vault.getAbstractFileByPath(path);
       if (f instanceof TFile) await this.app.vault.modifyBinary(f, data);
+      else if (await this.app.vault.adapter.exists(path)) await this.app.vault.adapter.writeBinary(path, data);
       else throw e;
     }
   }
 
   private async deleteFromDisk(key: string): Promise<void> {
     this.forgetSynced(key);
-    const f = this.fileOf(key);
+    const path = this.pathOf(key);
+    const f = this.app.vault.getAbstractFileByPath(path);
     if (f instanceof TFile) {
-      const parent = f.parent?.path ?? "";
       await this.app.fileManager.trashFile(f);
-      await this.pruneEmptyFolders(parent);
+    } else if (await this.localStat(key)) {
+      // Not indexed by Obsidian: trash through the adapter (system trash, else .trash).
+      const adapter = this.app.vault.adapter;
+      if (!(await adapter.trashSystem(path))) await adapter.trashLocal(path);
+    } else {
+      return;
     }
+    const slash = path.lastIndexOf("/");
+    await this.pruneEmptyFolders(slash > 0 ? path.slice(0, slash) : "");
   }
 
   /**
@@ -586,10 +646,12 @@ export class SyncEngine {
     this.markSynced(key, hashText(content));
   }
 
-  private async pushLocalBlob(key: string, file: TFile): Promise<void> {
+  private async pushLocalBlob(key: string): Promise<void> {
     if (this.stopped || !this.shouldSync(key) || this.isText(key)) return;
     if (this.blockedReadOnly(key)) return;
-    const data = await this.app.vault.readBinary(file);
+    const stat = await this.localStat(key);
+    if (!stat) return; // gone meanwhile
+    const data = await this.app.vault.adapter.readBinary(this.pathOf(key));
     const hash = await sha256Hex(data);
     const current = this.blobs.get(key);
     if (current?.hash === hash) {
@@ -605,9 +667,20 @@ export class SyncEngine {
       }
     }
     this.doc.transact(() => {
-      this.blobs.set(key, { hash, size: data.byteLength, mtime: file.stat.mtime });
+      this.blobs.set(key, { hash, size: data.byteLength, mtime: stat.mtime });
     }, this.localOrigin);
     this.markSynced(key, hash);
+  }
+
+  /** Push whatever is on disk for `key` (text or blob) into the shared doc. */
+  private async pushLocal(key: string): Promise<void> {
+    if (this.stopped || !this.shouldSync(key)) return;
+    if (this.isText(key)) {
+      const content = await this.readLocalText(key);
+      if (content !== null) this.pushLocalText(key, content);
+    } else {
+      await this.pushLocalBlob(key);
+    }
   }
 
   private removeFromDoc(key: string): void {
@@ -678,17 +751,15 @@ export class SyncEngine {
   private async applyRemoteBlob(key: string, meta: BlobMeta): Promise<void> {
     if (!this.shouldSync(key)) return;
     if (this.state.synced[key] === meta.hash) return;
-    const existing = this.fileOf(key);
-    if (existing instanceof TFile) {
-      const localHash = await sha256Hex(await this.app.vault.readBinary(existing));
+    const local = await this.readLocalBinary(key);
+    if (local) {
+      const localHash = await sha256Hex(local);
       if (localHash === meta.hash) {
         this.markSynced(key, meta.hash);
         return;
       }
       const lastSynced = this.state.synced[key];
-      if (lastSynced && lastSynced !== localHash) {
-        await this.writeConflictCopy(key, await this.app.vault.readBinary(existing));
-      }
+      if (lastSynced && lastSynced !== localHash) await this.writeConflictCopy(key, local);
     }
     if (!this.blobClient) return;
     // The metadata can arrive before the bytes (slow uploader, or a server-side bridge still
@@ -759,9 +830,8 @@ export class SyncEngine {
 
   /** A whole Y.Text was added or replaced remotely (new file, rename, or concurrent create). */
   private async applyRemoteTextReplace(key: string, content: string, replaced: boolean): Promise<void> {
-    const existing = this.fileOf(key);
-    if (existing instanceof TFile) {
-      const local = await this.app.vault.read(existing);
+    const local = await this.readLocalText(key);
+    if (local !== null) {
       if (local === content) {
         this.markSynced(key, hashText(content));
         return;
@@ -824,14 +894,8 @@ export class SyncEngine {
   private async onLocalChanged(f: TAbstractFile): Promise<void> {
     if (!(f instanceof TFile) || this.stopped) return;
     const key = this.keyOf(f.path);
-    if (!key || !this.shouldSync(key)) return;
-    if (this.isText(key)) {
-      // If an editor is open the editor-change path already handles it; still verify disk content.
-      const content = await this.app.vault.read(f);
-      this.pushLocalText(key, content);
-    } else {
-      await this.pushLocalBlob(key, f);
-    }
+    // For text, the editor-change path already handles open files; disk content is verified anyway.
+    if (key) await this.pushLocal(key);
   }
 
   private onLocalDeleted(f: TAbstractFile): void {
@@ -857,9 +921,12 @@ export class SyncEngine {
       } else if (oldPrefix !== null) {
         for (const k of this.docKeysWithPrefix(oldPrefix)) this.removeFromDoc(k);
       } else if (newPrefix !== null) {
-        for (const child of this.app.vault.getFiles()) {
-          if (child.path.startsWith(f.path + "/")) void this.onLocalChanged(child);
-        }
+        void this.listDisk(f.path).then((paths) => {
+          for (const p of paths) {
+            const key = this.keyOf(p);
+            if (key) void this.pushLocal(key);
+          }
+        });
       }
       return;
     }
@@ -879,17 +946,13 @@ export class SyncEngine {
    * last time the two agreed. Runs at startup and on demand. Idempotent.
    */
   async reconcileAll(opts: { allowMassDelete?: boolean } = {}): Promise<void> {
-    const localFiles = new Map<string, TFile>();
-    for (const f of this.app.vault.getFiles()) {
-      const key = this.keyOf(f.path);
-      if (key && this.shouldSync(key)) localFiles.set(key, f);
-    }
+    const localFiles = await this.scanLocal();
 
     // Local files first.
-    for (const [key, file] of localFiles) {
+    for (const key of localFiles) {
       try {
-        if (this.isText(key)) await this.reconcileText(key, file);
-        else await this.reconcileBlob(key, file);
+        if (this.isText(key)) await this.reconcileText(key);
+        else await this.reconcileBlob(key);
       } catch (e) {
         console.error(`[samsyn] reconcile failed for ${this.pathOf(key)}`, e);
       }
@@ -945,8 +1008,9 @@ export class SyncEngine {
     await this.persistence.flushState(this.state);
   }
 
-  private async reconcileText(key: string, file: TFile): Promise<void> {
-    const local = await this.app.vault.read(file);
+  private async reconcileText(key: string): Promise<void> {
+    const local = await this.readLocalText(key);
+    if (local === null) return; // gone since the scan
     const localHash = hashText(local);
     const ytext = this.texts.get(key);
     const lastSynced = this.state.synced[key];
@@ -979,15 +1043,17 @@ export class SyncEngine {
     }
   }
 
-  private async reconcileBlob(key: string, file: TFile): Promise<void> {
+  private async reconcileBlob(key: string): Promise<void> {
     const meta = this.blobs.get(key);
     const lastSynced = this.state.synced[key];
     if (!meta) {
       if (lastSynced) await this.deleteFromDisk(key);
-      else if (!this.target.readOnly) await this.pushLocalBlob(key, file);
+      else if (!this.target.readOnly) await this.pushLocalBlob(key);
       return;
     }
-    const localHash = await sha256Hex(await this.app.vault.readBinary(file));
+    const local = await this.readLocalBinary(key);
+    if (!local) return; // gone since the scan
+    const localHash = await sha256Hex(local);
     if (localHash === meta.hash) {
       this.markSynced(key, localHash);
       return;
@@ -995,13 +1061,14 @@ export class SyncEngine {
     if (lastSynced === localHash) {
       await this.applyRemoteBlob(key, meta);
     } else if (lastSynced === meta.hash && !this.target.readOnly) {
-      await this.pushLocalBlob(key, file);
+      await this.pushLocalBlob(key);
     } else {
       // Both changed: newer mtime wins, the loser is kept as a conflict copy.
-      if (file.stat.mtime > meta.mtime && !this.target.readOnly) {
-        await this.pushLocalBlob(key, file);
+      const stat = await this.localStat(key);
+      if (stat && stat.mtime > meta.mtime && !this.target.readOnly) {
+        await this.pushLocalBlob(key);
       } else {
-        await this.writeConflictCopy(key, await this.app.vault.readBinary(file));
+        await this.writeConflictCopy(key, local);
         await this.applyRemoteBlob(key, meta);
       }
     }

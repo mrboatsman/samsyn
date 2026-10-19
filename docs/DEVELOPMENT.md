@@ -160,6 +160,8 @@ Obsidian mobile does not expose a developer console. Options, in order of useful
 
 `SyncEngine` is instantiated once per sync target (`EngineTarget`): the *home* engine (own server, whole vault, keys == vault paths) and one *guest* engine per guest mount (owner's server, one folder, keys relative to the folder). All path mapping happens at the Obsidian boundary: `keyOf(vaultPath)` returns the document key or `null` when the path is outside this engine's scope (other engines' roots, config dir, excludes); `pathOf(key)` goes back. Everything between (observers, reconcile, conflict copies, mass-delete guard) works on keys and is identical for both kinds. `SamsynPlugin.engines` holds them; `plugin.engine` is the home engine.
 
+Local files are read from **disk**, not from Obsidian's index. `vault.getFiles()` and the `create`/`modify` events only cover extensions Obsidian detects (Markdown, canvas, PDF, images, audio, video) plus files created through its own API; a `.js`, `.css`, `.html` or `.txt` file dropped into the vault by git or Finder has no `TFile` unless the user turns on "Detect all file extensions". Reconcile therefore walks the adapter (`src/walk.ts`, unioned with the index) and the engine reads, writes and deletes through the adapter whenever there is no `TFile` for a path (`readLocalText`/`readLocalBinary`/`localStat`). Such files have no live events: they sync at startup, on "Reconcile all files now", and from any device where they arrived through samsyn (which creates them via the vault API, so they are indexed there).
+
 ## Local cache on the device
 
 The plugin keeps two things per device and vault, both in **IndexedDB** (`src/persistence.ts`), never in the vault folder:
