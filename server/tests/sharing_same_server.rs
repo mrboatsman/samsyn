@@ -75,9 +75,7 @@ fn share_mount_edit_revoke_restart() {
     eventually!(30, c.proc.log_contains("read-only share"), "carol learns ro", c.proc);
     let perms = std::fs::metadata(c.path("Shared/X/a.md")).unwrap().permissions();
     assert!(perms.readonly(), "ro files are read-only on disk");
-    let mut p = perms.clone();
-    p.set_readonly(false);
-    std::fs::set_permissions(c.path("Shared/X/a.md"), p).unwrap();
+    make_writable(&c.path("Shared/X/a.md"));
     c.append("Shared/X/a.md", "carol-edit");
     sleep(3.0);
     assert!(!a.contains("Projects/X/a.md", "carol-edit"), "ro edit reached owner");

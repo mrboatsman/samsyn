@@ -46,4 +46,5 @@ bookmark unless asked.
 - Never bump versions by hand. Stable releases come from merging the automated
   release PR; betas from the Release workflow button. Both run
   `scripts/version.mjs` and `git-cliff`; see docs/DEVELOPMENT.md "Releasing".
-- `third_party/yrs` is a patched vendored copy; do not edit it (see its PATCH.md).
+- `third_party/yrs` is a patched vendored copy; do not edit it (see its PATCH.md,
+  which also explains the one manifest-only addition, a `[lints]` table).

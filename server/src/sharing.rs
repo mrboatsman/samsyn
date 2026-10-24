@@ -950,7 +950,7 @@ pub async fn delete_mount(
         Ok(_) => return err(StatusCode::NOT_FOUND, "no such mount"),
         Err(e) => return internal(e),
     };
-    state.docs.remove_bridges_for_mounts(&[mount.id.clone()]);
+    state.docs.remove_bridges_for_mounts(std::slice::from_ref(&mount.id));
     if let Err(e) = reg.delete_mount(&mount.id) {
         return internal(e);
     }

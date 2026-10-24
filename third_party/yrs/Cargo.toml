@@ -121,3 +121,10 @@ version = "1.6.0"
 
 [dev-dependencies.uuid]
 version = "1.26"
+
+# Local addition, not in pristine yrs 0.28.0 (see PATCH.md, "Manifest addition"). As a path
+# dependency this crate counts as local to cargo, so its rustc lints are shown instead of being
+# capped as for the crates.io version; a toolchain newer than yrs 0.28 targets reports ~60
+# warnings on every build. They are upstream's to fix, not ours.
+[lints.rust]
+warnings = "allow"

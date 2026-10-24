@@ -10,12 +10,6 @@ fn readonly(p: &std::path::Path) -> bool {
     std::fs::metadata(p).map(|m| m.permissions().readonly()).unwrap_or(false)
 }
 
-fn make_writable(p: &std::path::Path) {
-    let mut perms = std::fs::metadata(p).unwrap().permissions();
-    perms.set_readonly(false);
-    std::fs::set_permissions(p, perms).unwrap();
-}
-
 #[test]
 fn whole_vault_read_only_with_writable_paths() {
     let dir = tmp("mixed");

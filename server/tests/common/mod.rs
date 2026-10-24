@@ -279,3 +279,13 @@ pub fn tmp(name: &str) -> PathBuf {
     std::fs::create_dir_all(&d).unwrap();
     d
 }
+
+/// Strip the read-only bit a client put on a file inside a read-only share, so a test can try
+/// to edit it anyway. Test fixture only: clippy's concern (world-writable on unix) is moot in a
+/// throwaway directory.
+#[allow(clippy::permissions_set_readonly_false)]
+pub fn make_writable(p: &Path) {
+    let mut perms = std::fs::metadata(p).unwrap().permissions();
+    perms.set_readonly(false);
+    std::fs::set_permissions(p, perms).unwrap();
+}

@@ -113,9 +113,7 @@ fn guests_join_with_tickets_only() {
 
     // Read-only guest.
     eventually!(30, std::fs::metadata(g2.path("a.md")).map(|m| m.permissions().readonly()).unwrap_or(false), "ro files read-only on disk", g2.proc);
-    let mut p = std::fs::metadata(g2.path("a.md")).unwrap().permissions();
-    p.set_readonly(false);
-    std::fs::set_permissions(g2.path("a.md"), p).unwrap();
+    make_writable(&g2.path("a.md"));
     g2.append("a.md", "ro-edit");
     sleep(3.0);
     assert!(!o.contains("Projects/X/a.md", "ro-edit"));
@@ -146,9 +144,7 @@ fn guests_join_with_tickets_only() {
     eventually!(10, o.contains("Projects/X/sub/b.md", "mixed-guest-edit"), "owner sees the mixed guest's edit", o.proc, server.proc);
     g3.write_bytes("sub/g3.gif", b"GIF89a g3");
     eventually!(15, o.same_bytes("Projects/X/sub/g3.gif", &g3.path("sub/g3.gif")), "mixed guest can upload blobs", o.proc, server.proc);
-    let mut p = std::fs::metadata(g3.path("a.md")).unwrap().permissions();
-    p.set_readonly(false);
-    std::fs::set_permissions(g3.path("a.md"), p).unwrap();
+    make_writable(&g3.path("a.md"));
     g3.append("a.md", "mixed-ro-edit");
     sleep(3.0);
     assert!(!o.contains("Projects/X/a.md", "mixed-ro-edit"), "read-only edit from the mixed guest reached the owner");

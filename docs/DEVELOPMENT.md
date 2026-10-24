@@ -8,7 +8,7 @@
 
 ## Vendored dependency: yrs
 
-`third_party/yrs` is a copy of `yrs` 0.28.0 with one security fix (decode count caps; see `third_party/yrs/PATCH.md` and the upstream report, y-crdt/y-crdt#675), pulled in via `[patch.crates-io]` in `server/Cargo.toml` and `server/fuzz/Cargo.toml`. It is temporary: when the fix lands upstream, delete the directory and both `[patch]` stanzas and bump the `yrs` version. Do not make unrelated local edits to it.
+`third_party/yrs` is a copy of `yrs` 0.28.0 with one security fix (decode count caps; see `third_party/yrs/PATCH.md` and the upstream report, y-crdt/y-crdt#675), pulled in via `[patch.crates-io]` in `server/Cargo.toml` and `server/fuzz/Cargo.toml`. It is temporary: when the fix lands upstream, delete the directory and both `[patch]` stanzas and bump the `yrs` version. Do not make unrelated local edits to it; the only non-patch change is a `[lints]` table in its `Cargo.toml` that keeps its rustc warnings out of every build (path dependencies are not lint-capped the way registry crates are).
 
 ## Server crate layout
 

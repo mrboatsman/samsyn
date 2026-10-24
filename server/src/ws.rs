@@ -65,7 +65,7 @@ pub fn plausible_payload(data: &[u8]) -> bool {
             // step 1 (0), step 2 (1) and update (2).
             0 => {
                 let Some(sub) = read_varuint(data, &mut pos) else { return false };
-                if !matches!(sub, 0 | 1 | 2) {
+                if !matches!(sub, 0..=2) {
                     return false;
                 }
                 if !bounded_buffer(data, &mut pos) {

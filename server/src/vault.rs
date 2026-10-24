@@ -544,6 +544,7 @@ impl DocRegistry {
     /// deletion to the other side: detach the bridge, rename the keys inside the vault document,
     /// store the new prefix, attach again. Returns the updated row(s) for the API.
     /// `only_file` is `Some` for single-note shares (the note may be renamed too).
+    #[allow(clippy::too_many_arguments)]
     pub fn move_prefix(
         self: &Arc<Self>,
         vault_id: &str,

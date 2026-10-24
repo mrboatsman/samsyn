@@ -25,6 +25,14 @@ Diff is limited to:
 - `src/updates/decoder.rs` — `remaining()` + `check_len()` on the trait, `remaining()` for `DecoderV1`.
 - `src/update.rs`, `src/id_set.rs`, `src/state_vector.rs` — a `check_len(...)?` before each count use.
 
+## Manifest addition
+
+`Cargo.toml` additionally carries a `[lints.rust] warnings = "allow"` table that pristine yrs
+0.28.0 does not have. Cargo caps the lints of registry crates but not of path dependencies, and
+this copy is pulled in by path, so without it a current toolchain prints ~60 rustc warnings
+from yrs on every build of the server, its tests and the fuzz targets. The table changes no
+behaviour and is not part of `0001-cap-decode-counts.patch`; it goes away with the directory.
+
 ## Upstream
 
 This is the same problem as y-crdt/y-crdt#675 ("Decoding reserves what the input claims"),

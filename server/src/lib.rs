@@ -10,6 +10,10 @@
 //! - [`client`]: the headless sync client.
 //! - [`config`], [`cli`]: command-line surface.
 
+// Handlers hand back a ready `axum::Response` as their error, which is a large type by
+// clippy's measure; boxing it would only add noise at every `return r`.
+#![allow(clippy::result_large_err)]
+
 /// The version this build reports (`/health`, `--version`). Releases stamp it into
 /// Cargo.toml; Docker builds of untagged commits and betas pass `SAMSYN_VERSION` instead
 /// (see server/Dockerfile and .github/workflows/docker.yml).

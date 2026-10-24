@@ -100,7 +100,7 @@ impl Engine {
                 for ev in events.iter() {
                     match ev {
                         Event::Map(m) if ev.path().is_empty() => {
-                            for (k, _) in m.keys(txn) {
+                            for k in m.keys(txn).keys() {
                                 d.insert(k.to_string());
                             }
                         }
@@ -120,7 +120,7 @@ impl Engine {
                     return;
                 }
                 let mut d = dirty.lock();
-                for (k, _) in ev.keys(txn) {
+                for k in ev.keys(txn).keys() {
                     d.insert(k.to_string());
                 }
             });
