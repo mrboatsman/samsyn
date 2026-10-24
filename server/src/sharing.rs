@@ -12,8 +12,9 @@ use serde::Deserialize;
 
 use crate::access::{clean_rw_paths, describe};
 use crate::ids::valid_name;
-use crate::storage::{ShareInfo, User};
+use crate::storage::{MountInfo, ShareInfo, User};
 use crate::ticket::Ticket;
+use crate::vault::overlaps;
 use crate::ws::authenticate;
 use crate::SharedState;
 
@@ -40,10 +41,6 @@ fn clean_name(n: &str) -> String {
     if s.is_empty() { "share".to_string() } else { s }
 }
 
-fn overlaps(a: &str, b: &str) -> bool {
-    a == b || a.starts_with(b) || b.starts_with(a)
-}
-
 fn user_vault(state: &SharedState, user: &User, vault: &str) -> Result<(crate::storage::VaultInfo, std::sync::Arc<crate::vault::LiveDoc>), Response> {
     if !valid_name(vault) {
         return Err(err(StatusCode::BAD_REQUEST, "invalid vault name"));
@@ -53,47 +50,97 @@ fn user_vault(state: &SharedState, user: &User, vault: &str) -> Result<(crate::s
     Ok((info, doc))
 }
 
-/// Full paths (`Projects/X/`, `Notes/a.md`, `""` for the whole vault) of a vault's shares and
-/// of its active mounts, for the overlap rules: shares may nest inside each other (the vault
-/// document is the hub, every bridge sees each change once), but no two shares may have the
-/// same path, and a mount never overlaps anything, since it is content other people share with
-/// us and must not be shared onward.
+/// A vault's shares and active mounts, for the overlap rules. Shares may nest inside each
+/// other (the vault document is the hub, every bridge sees each change once), but no two
+/// shares may have the same path. A mount is content other people share with us: it may sit
+/// strictly inside a folder share (the owner then decides per share whether that share carries
+/// it onward, see `MountInfo::forward_shares`), but nothing may be shared from inside a mount,
+/// and mounts never overlap each other.
 struct Taken {
-    shares: Vec<(String, String)>,
-    mounts: Vec<String>,
+    shares: Vec<ShareInfo>,
+    /// Active mounts only. Revoked rows keep their folder out of the enclosing shares (see
+    /// `vault::owner_excludes`) but do not block anything.
+    mounts: Vec<MountInfo>,
 }
 
 fn taken_prefixes(state: &SharedState, vault_id: &str) -> anyhow::Result<Taken> {
     let reg = state.storage.registry();
-    let shares = reg
-        .shares_for_vault(vault_id)?
-        .into_iter()
-        .map(|s| (share_full_path(&s.prefix, s.only_file.as_deref()), s.name))
-        .collect();
-    let mounts = reg.mounts_for_vault(vault_id)?.into_iter().filter(|m| m.revoked_at.is_none()).map(|m| m.mount_prefix).collect();
+    let shares = reg.shares_for_vault(vault_id)?;
+    let mounts = reg.mounts_for_vault(vault_id)?.into_iter().filter(|m| m.revoked_at.is_none()).collect();
     Ok(Taken { shares, mounts })
 }
 
+fn share_full(s: &ShareInfo) -> String {
+    share_full_path(&s.prefix, s.only_file.as_deref())
+}
+
 impl Taken {
-    fn all(&self) -> impl Iterator<Item = &String> {
-        self.shares.iter().map(|(p, _)| p).chain(self.mounts.iter())
+    /// A new share at `full` (`Projects/X/`, `Notes/a.md`, `""` for the whole vault): refused
+    /// with a reason, or allowed with the mounts strictly inside it, which the owner may or may
+    /// not carry onward with the new share.
+    fn refuses_share(&self, full: &str) -> Result<Vec<&MountInfo>, String> {
+        let is_folder = full.is_empty() || full.ends_with('/');
+        let mut inner = Vec::new();
+        let mut blocking = Vec::new();
+        for m in &self.mounts {
+            if !overlaps(&m.mount_prefix, full) {
+                continue;
+            }
+            if is_folder && m.mount_prefix != full && m.mount_prefix.starts_with(full) {
+                inner.push(m);
+            } else {
+                blocking.push(show_path(m.mount_prefix.trim_end_matches('/')));
+            }
+        }
+        if !blocking.is_empty() {
+            return Err(format!("this path is inside a folder other people share with you ({}); their content cannot be shared onward", blocking.join(", ")));
+        }
+        if let Some(s) = self.shares.iter().find(|s| share_full(s) == full) {
+            return Err(format!("{} is already shared as \"{}\"; issue another ticket for that share instead", show_path(full.trim_end_matches('/')), s.name));
+        }
+        Ok(inner)
     }
 
-    /// Why a new share at `full` is refused, if it is.
-    fn refuses_share(&self, full: &str) -> Option<String> {
-        let mounts: Vec<String> = self.mounts.iter().filter(|m| overlaps(m, full)).map(|m| show_path(m.trim_end_matches('/'))).collect();
-        if !mounts.is_empty() {
-            return Some(if full.is_empty() {
-                format!("the whole vault cannot be shared while it contains folders other people share with you ({}); unmount those first, or share a folder instead", mounts.join(", "))
+    /// A mount at the folder `prefix` (trailing slash): refused with a reason, or allowed with
+    /// the folder shares that enclose it. `skip_mount` is the mount being moved, if any.
+    fn refuses_mount(&self, prefix: &str, skip_mount: Option<&str>) -> Result<Vec<&ShareInfo>, String> {
+        let mut enclosing = Vec::new();
+        for s in &self.shares {
+            let full = share_full(s);
+            if !overlaps(&full, prefix) {
+                continue;
+            }
+            if s.only_file.is_none() && prefix != full && prefix.starts_with(&full) {
+                enclosing.push(s);
             } else {
-                format!("this path overlaps a folder other people share with you ({}); their content cannot be shared onward", mounts.join(", "))
-            });
+                return Err(format!("mount path overlaps what you share as \"{}\" ({})", s.name, show_path(full.trim_end_matches('/'))));
+            }
         }
-        if let Some((_, name)) = self.shares.iter().find(|(p, _)| p == full) {
-            return Some(format!("{} is already shared as \"{name}\"; issue another ticket for that share instead", show_path(full.trim_end_matches('/'))));
+        for m in &self.mounts {
+            if Some(m.id.as_str()) == skip_mount {
+                continue;
+            }
+            if overlaps(&m.mount_prefix, prefix) {
+                return Err(format!("mount path overlaps a folder other people share with you ({})", show_path(m.mount_prefix.trim_end_matches('/'))));
+            }
         }
-        None
+        Ok(enclosing)
     }
+}
+
+/// The ids a request wants forwarding for, checked against the ids that are eligible.
+/// Duplicates collapse; an id outside the eligible set is a 400 with `what` in the message.
+fn chosen_ids(requested: Option<Vec<String>>, eligible: &[&str], what: &str) -> Result<Vec<String>, Response> {
+    let mut out: Vec<String> = Vec::new();
+    for id in requested.unwrap_or_default() {
+        if !eligible.contains(&id.as_str()) {
+            return Err(err(StatusCode::BAD_REQUEST, format!("{id} is not {what}")));
+        }
+        if !out.contains(&id) {
+            out.push(id);
+        }
+    }
+    Ok(out)
 }
 
 // ------------------------------------------------------------------ GET /api/vaults/{vault}/sharing
@@ -154,6 +201,7 @@ pub async fn get_sharing(
             serde_json::json!({
                 "id": m.id, "share_id": m.share_id, "name": m.share_name, "mount_path": m.mount_prefix.trim_end_matches('/'),
                 "access": m.access, "rw_paths": m.rw_paths, "home_node": m.home_node, "status": status, "created_at": m.created_at,
+                "forward_shares": m.forward_shares,
             })
         })
         .collect();
@@ -170,6 +218,9 @@ pub struct CreateShare {
     pub access: Option<String>,
     /// Share-relative paths the first ticket may write although it is read-only.
     pub rw_paths: Option<Vec<String>>,
+    /// Ids of mounts inside the shared folder whose content the new share carries onward to
+    /// its holders. Mounts inside the folder that are not listed are skipped by the share.
+    pub forward_mounts: Option<Vec<String>>,
 }
 
 fn make_ticket(state: &SharedState, share: &ShareInfo, secret: String, access: &str, rw_paths: &[String]) -> anyhow::Result<String> {
@@ -256,14 +307,19 @@ pub async fn create_share(
     let full = share_full_path(&prefix, only_file.as_deref());
     // Check + insert + attach under one lock, otherwise two concurrent creates could both pass.
     let _admin = state.docs.share_admin.lock();
-    match taken_prefixes(&state, &info.id) {
-        Ok(taken) => {
-            if let Some(msg) = taken.refuses_share(&full) {
-                return err(StatusCode::CONFLICT, msg);
-            }
-        }
+    let taken = match taken_prefixes(&state, &info.id) {
+        Ok(t) => t,
         Err(e) => return internal(e),
-    }
+    };
+    let inner = match taken.refuses_share(&full) {
+        Ok(inner) => inner,
+        Err(msg) => return err(StatusCode::CONFLICT, msg),
+    };
+    let inner_ids: Vec<&str> = inner.iter().map(|m| m.id.as_str()).collect();
+    let forward_mounts = match chosen_ids(body.forward_mounts, &inner_ids, "a folder shared with you inside this path") {
+        Ok(ids) => ids,
+        Err(r) => return r,
+    };
     let name = clean_name(&body.name.filter(|n| !n.trim().is_empty()).unwrap_or_else(|| {
         if path.is_empty() { info.name.clone() } else { path.rsplit('/').next().unwrap_or(&path).to_string() }
     }));
@@ -273,6 +329,15 @@ pub async fn create_share(
         Ok(s) => s,
         Err(e) => return internal(e),
     };
+    // Record the forwarding before the bridge is built: it reads the mounts' lists.
+    for m in inner.iter().filter(|m| forward_mounts.contains(&m.id)) {
+        let mut ids = m.forward_shares.clone();
+        ids.push(share.id.clone());
+        if let Err(e) = reg.update_mount_forward(&m.id, &ids) {
+            let _ = reg.delete_share(&share.id);
+            return internal(e);
+        }
+    }
     let secret = match reg.create_grant(&share.id, "ticket-1", &access, &rw_paths) {
         Ok(s) => s,
         Err(e) => return internal(e),
@@ -285,8 +350,9 @@ pub async fn create_share(
         Ok(t) => t,
         Err(e) => return internal(e),
     };
-    tracing::info!(user = %user.name, share = %share.name, "share created for {} ({})", show_path(&full), describe(&access, &rw_paths));
-    Json(serde_json::json!({ "share": share, "path": full.trim_end_matches('/'), "ticket": ticket, "label": "ticket-1", "access": access, "rw_paths": rw_paths })).into_response()
+    let skipped = inner.len() - forward_mounts.len();
+    tracing::info!(user = %user.name, share = %share.name, "share created for {} ({}); {} mount(s) inside carried onward, {skipped} skipped", show_path(&full), describe(&access, &rw_paths), forward_mounts.len());
+    Json(serde_json::json!({ "share": share, "path": full.trim_end_matches('/'), "ticket": ticket, "label": "ticket-1", "access": access, "rw_paths": rw_paths, "forward_mounts": forward_mounts })).into_response()
 }
 
 // ------------------------------------------------------------------ POST /api/shares/{id}/tickets
@@ -470,6 +536,9 @@ pub async fn delete_share(
 pub struct CreateMount {
     pub ticket: String,
     pub mount_path: Option<String>,
+    /// Ids of this vault's own shares that enclose `mount_path` and should carry the mounted
+    /// content onward to their holders. Enclosing shares not listed skip the folder.
+    pub forward_shares: Option<Vec<String>>,
 }
 
 pub async fn create_mount(
@@ -538,14 +607,19 @@ pub async fn create_mount(
     }
     let prefix = format!("{mount_path}/");
     let _admin = state.docs.share_admin.lock();
-    match taken_prefixes(&state, &info.id) {
-        Ok(taken) => {
-            if taken.all().any(|t| overlaps(t, &prefix)) {
-                return err(StatusCode::CONFLICT, "mount path overlaps an existing share or mount");
-            }
-        }
+    let taken = match taken_prefixes(&state, &info.id) {
+        Ok(t) => t,
         Err(e) => return internal(e),
-    }
+    };
+    let enclosing = match taken.refuses_mount(&prefix, None) {
+        Ok(e) => e,
+        Err(msg) => return err(StatusCode::CONFLICT, msg),
+    };
+    let enclosing_ids: Vec<&str> = enclosing.iter().map(|s| s.id.as_str()).collect();
+    let forward_shares = match chosen_ids(body.forward_shares, &enclosing_ids, "a share of yours that contains this folder") {
+        Ok(ids) => ids,
+        Err(r) => return r,
+    };
     if doc.keys().iter().any(|k| k.starts_with(&prefix)) {
         return err(StatusCode::CONFLICT, format!("'{mount_path}' already contains files; choose an empty or new folder"));
     }
@@ -561,6 +635,7 @@ pub async fn create_mount(
         &ticket.addrs,
         only_file.as_deref(),
         &ticket.secret,
+        &forward_shares,
     ) {
         Ok(m) => m,
         Err(e) => return internal(e),
@@ -569,8 +644,63 @@ pub async fn create_mount(
         let _ = reg.delete_mount(&mount.id);
         return internal(e);
     }
-    tracing::info!(user = %user.name, share = %share_name, remote, "mounted at {prefix} via {label} ({})", describe(access, &rw_paths));
-    Json(serde_json::json!({ "mount": mount, "mount_path": mount_path, "access": access, "rw_paths": rw_paths })).into_response()
+    let skipped = enclosing.len() - forward_shares.len();
+    tracing::info!(user = %user.name, share = %share_name, remote, "mounted at {prefix} via {label} ({}); carried onward by {} enclosing share(s), skipped by {skipped}", describe(access, &rw_paths), forward_shares.len());
+    Json(serde_json::json!({ "mount": mount, "mount_path": mount_path, "access": access, "rw_paths": rw_paths, "forward_shares": forward_shares })).into_response()
+}
+
+// ------------------------------------------------------------------ PUT /api/mounts/{id}/forward
+
+#[derive(Deserialize)]
+pub struct ForwardShares {
+    /// The complete new set: enclosing shares that carry this mount onward.
+    pub share_ids: Vec<String>,
+}
+
+/// Change which of the enclosing shares carry a mount's content onward. A share that stops
+/// carrying it drops the folder from its holders; one that starts gets the folder copied in.
+pub async fn set_mount_forward(
+    Path(id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    State(state): State<SharedState>,
+    Json(body): Json<ForwardShares>,
+) -> Response {
+    let user = match authenticate(&state, &headers, &query) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let reg = state.storage.registry();
+    let mount = match reg.mount_by_id(&id) {
+        Ok(Some(m)) if m.user_id == user.id => m,
+        Ok(_) => return err(StatusCode::NOT_FOUND, "no such mount"),
+        Err(e) => return internal(e),
+    };
+    if mount.revoked_at.is_some() {
+        return err(StatusCode::CONFLICT, "this mount was revoked; its folder is never carried onward");
+    }
+    let _admin = state.docs.share_admin.lock();
+    let taken = match taken_prefixes(&state, &mount.vault_id) {
+        Ok(t) => t,
+        Err(e) => return internal(e),
+    };
+    let enclosing = match taken.refuses_mount(&mount.mount_prefix, Some(&mount.id)) {
+        Ok(e) => e,
+        Err(msg) => return err(StatusCode::CONFLICT, msg),
+    };
+    let enclosing_ids: Vec<&str> = enclosing.iter().map(|s| s.id.as_str()).collect();
+    let share_ids = match chosen_ids(Some(body.share_ids), &enclosing_ids, "a share of yours that contains this folder") {
+        Ok(ids) => ids,
+        Err(r) => return r,
+    };
+    if let Err(e) = reg.update_mount_forward(&mount.id, &share_ids) {
+        return internal(e);
+    }
+    if let Err(e) = state.docs.refresh_owner_bridges(&mount.vault_id, std::slice::from_ref(&mount.mount_prefix)) {
+        return internal(e);
+    }
+    tracing::info!(user = %user.name, "mount {} now carried onward by {} of {} enclosing share(s)", mount.mount_prefix, share_ids.len(), enclosing.len());
+    Json(serde_json::json!({ "forward_shares": share_ids })).into_response()
 }
 
 // ------------------------------------------------------------------ PATCH /api/mounts/{id}, PATCH /api/shares/{id}
@@ -580,25 +710,6 @@ pub struct MovePath {
     /// Mounts: the new folder. Shares: the new folder or note path.
     #[serde(alias = "mount_path")]
     pub path: String,
-}
-
-/// Overlap check for a mount's new prefix (against every share and every other active mount).
-fn mount_prefix_taken(state: &SharedState, vault_id: &str, skip_mount: &str, full: &str) -> anyhow::Result<bool> {
-    let reg = state.storage.registry();
-    for s in reg.shares_for_vault(vault_id)? {
-        if overlaps(&share_full_path(&s.prefix, s.only_file.as_deref()), full) {
-            return Ok(true);
-        }
-    }
-    for m in reg.mounts_for_vault(vault_id)? {
-        if m.revoked_at.is_some() || m.id == skip_mount {
-            continue;
-        }
-        if overlaps(&m.mount_prefix, full) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
 }
 
 /// Move a mount to another folder. Used by the plugin when the user moves the folder in
@@ -635,11 +746,18 @@ pub async fn move_mount(
         return Json(serde_json::json!({ "mount_path": new_path })).into_response();
     }
     let _admin = state.docs.share_admin.lock();
-    match mount_prefix_taken(&state, &mount.vault_id, &mount.id, &new_prefix) {
-        Ok(true) => return err(StatusCode::CONFLICT, "the new folder overlaps another share or mount"),
-        Ok(false) => {}
+    let taken = match taken_prefixes(&state, &mount.vault_id) {
+        Ok(t) => t,
         Err(e) => return internal(e),
-    }
+    };
+    let enclosing = match taken.refuses_mount(&new_prefix, Some(&mount.id)) {
+        Ok(e) => e,
+        Err(msg) => return err(StatusCode::CONFLICT, format!("the new folder is not allowed: {msg}")),
+    };
+    // Forwarding is a decision about a specific enclosing share. It follows the mount while it
+    // stays inside that share and lapses when it leaves; a share it moves into starts out
+    // skipping it, the safe default (the UI offers the choice again).
+    let kept: Vec<String> = mount.forward_shares.iter().filter(|id| enclosing.iter().any(|s| &s.id == *id)).cloned().collect();
     let doc = match state.docs.load_vault_by_id(&mount.vault_id) {
         Ok(d) => d,
         Err(e) => return internal(e),
@@ -652,6 +770,11 @@ pub async fn move_mount(
     });
     if stray {
         return err(StatusCode::CONFLICT, format!("'{new_path}' already contains other files; choose an empty or new folder"));
+    }
+    if kept != mount.forward_shares {
+        if let Err(e) = reg.update_mount_forward(&mount.id, &kept) {
+            return internal(e);
+        }
     }
     if let Err(e) = state.docs.move_prefix(&mount.vault_id, &mount.share_id, Some(&mount.id), &mount.mount_prefix, &new_prefix, None, None) {
         return internal(e);
@@ -704,15 +827,24 @@ pub async fn move_share(
         Ok(taken) => {
             // Other shares nested inside this one would be carried along without their
             // registry rows following; refuse rather than guess.
-            let inner: Vec<&String> = taken.shares.iter().map(|(p, _)| p).filter(|p| *p != &old_full && p.starts_with(&old_full)).collect();
+            let inner: Vec<String> = taken.shares.iter().map(share_full).filter(|p| *p != old_full && p.starts_with(&old_full)).collect();
             if !inner.is_empty() {
                 return err(StatusCode::CONFLICT, format!("{} contains other shares ({}); move or unshare those first", show_path(old_full.trim_end_matches('/')), inner.iter().map(|p| p.trim_end_matches('/')).collect::<Vec<_>>().join(", ")));
             }
-            let others = Taken { shares: taken.shares.iter().filter(|(p, _)| p != &old_full).cloned().collect(), mounts: taken.mounts.clone() };
-            if let Some(msg) = others.refuses_share(&full) {
-                return err(StatusCode::CONFLICT, msg);
+            // Mounts inside the share would be carried along without their rows following.
+            let inner_mounts: Vec<&str> = taken.mounts.iter().filter(|m| share.only_file.is_none() && m.mount_prefix.starts_with(&old_full)).map(|m| m.mount_prefix.trim_end_matches('/')).collect();
+            if !inner_mounts.is_empty() {
+                return err(StatusCode::CONFLICT, format!("{} contains folders other people share with you ({}); move or unmount those first", show_path(old_full.trim_end_matches('/')), inner_mounts.join(", ")));
             }
-            if others.shares.iter().any(|(p, _)| p.starts_with(&full)) {
+            let others = Taken { shares: taken.shares.iter().filter(|s| share_full(s) != old_full).cloned().collect(), mounts: taken.mounts.clone() };
+            match others.refuses_share(&full) {
+                Err(msg) => return err(StatusCode::CONFLICT, msg),
+                Ok(mounts_inside) if !mounts_inside.is_empty() => {
+                    return err(StatusCode::CONFLICT, "the new path would contain folders other people share with you; share it anew there instead");
+                }
+                Ok(_) => {}
+            }
+            if others.shares.iter().any(|s| share_full(s).starts_with(&full)) {
                 return err(StatusCode::CONFLICT, "the new path would contain another share");
             }
         }
@@ -821,6 +953,11 @@ pub async fn delete_mount(
     state.docs.remove_bridges_for_mounts(&[mount.id.clone()]);
     if let Err(e) = reg.delete_mount(&mount.id) {
         return internal(e);
+    }
+    // The folder is ordinary notes now; an enclosing share that skipped it carries it like
+    // the rest of the vault (the UI says so before unmounting).
+    if let Err(e) = state.docs.refresh_owner_bridges(&mount.vault_id, std::slice::from_ref(&mount.mount_prefix)) {
+        tracing::warn!(user = %user.name, "refreshing shares around {} failed: {e}", mount.mount_prefix);
     }
     if mount.home_node != state.docs.node_id {
         let dir = state.storage.mount_dir(&mount.user_id, &mount.id);

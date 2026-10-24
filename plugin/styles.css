@@ -143,6 +143,21 @@
   margin: 8px 0;
   font-size: var(--font-ui-small);
 }
+/* "Carried onward?" block: a mount inside a share, or a share around a mount. */
+.samsyn-forward:not(:empty) {
+  border: 1px solid var(--text-warning);
+  border-radius: 6px;
+  padding: 8px 12px;
+  margin: 8px 0;
+  font-size: var(--font-ui-small);
+}
+.samsyn-forward > p:first-child {
+  margin: 0 0 4px;
+  color: var(--text-warning);
+}
+.samsyn-forward .setting-item {
+  padding: 4px 0;
+}
 
 /* QR codes */
 .samsyn-qr {

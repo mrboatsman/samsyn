@@ -1,7 +1,9 @@
 import { Notice, Setting } from "obsidian";
 import { SamsynApi, SharingInfo } from "./api";
 import type SamsynPlugin from "./main";
-import { accessText, ConfirmModal, MountModal, MoveMountModal, NewTicketModal, pathText, ShareModal } from "./sharing-modals";
+import { accessText, ConfirmModal, enclosingShares, ForwardModal, MountModal, MoveMountModal, NewTicketModal, pathText, ShareModal } from "./sharing-modals";
+
+const quoted = (names: string[]) => names.map((n) => `“${n}”`).join(", ");
 
 function describeStatus(status: string): string {
   if (status === "active") return "live, same server";
@@ -244,20 +246,30 @@ export class SharingSection {
       const revoked = m.status.startsWith("revoked");
       const card = el.createDiv({ cls: "samsyn-card" + (revoked ? " samsyn-revoked" : "") });
       const row = new Setting(card).setName(m.name).setClass("samsyn-card-head");
-      if (revoked) row.setDesc(`${m.mount_path} · access revoked by the owner · no longer syncing · your copy stays as ordinary notes`);
+      // Shares of mine this mount sits inside: each either carries it onward or skips it.
+      const enclosing = enclosingShares(info, m.mount_path);
+      const onward = enclosing.filter((s) => (m.forward_shares ?? []).includes(s.id));
+      const insideText = enclosing.length
+        ? ` · inside ${quoted(enclosing.map((s) => s.name))}: ${onward.length ? `shared onward with ${quoted(onward.map((s) => s.name))}` : "not shared onward"}`
+        : "";
+      if (revoked) row.setDesc(`${m.mount_path} · access revoked by the owner · no longer syncing · your copy stays as ordinary notes${enclosing.length ? " · kept out of your shares until removed" : ""}`);
       else {
-        row.setDesc(`${m.mount_path} · ${accessText(m.access, m.rw_paths)} · ${describeStatus(m.status)}`);
+        row.setDesc(`${m.mount_path} · ${accessText(m.access, m.rw_paths)} · ${describeStatus(m.status)}${insideText}`);
+        if (enclosing.length) row.addButton((b) => b.setButtonText("Onward…").onClick(() => new ForwardModal(this.plugin, m, enclosing, reload).open()));
         row.addButton((b) =>
           b.setButtonText("Move…").onClick(() =>
             new MoveMountModal(this.plugin, { kind: "mount", id: m.id, name: m.name, path: m.mount_path, isFile: false }, reload).open(),
           ),
         );
       }
+      const leftovers = enclosing.length
+        ? ` As ordinary notes they are then part of ${quoted(enclosing.map((s) => s.name))} like everything else there, and reach the people holding tickets for ${enclosing.length === 1 ? "it" : "them"}.`
+        : "";
       row.addButton((b) =>
         b.setButtonText(revoked ? "Remove" : "Unmount").onClick(() =>
           this.confirm(
             revoked ? `Remove ${m.name} from the list?` : `Unmount ${m.name}?`,
-            `The files under ${m.mount_path} stay in your vault as ordinary notes; they just stop syncing with the owner.`,
+            `The files under ${m.mount_path} stay in your vault as ordinary notes; they just stop syncing with the owner.${leftovers}`,
             revoked ? "Remove" : "Unmount",
             () => this.api.unmount(m.id),
           ),
@@ -299,10 +311,13 @@ export class SharingSection {
               ? "connecting to the owner's server…"
               : `offline${d.lastError ? ` · ${d.lastError}` : ""}`;
       const card = el.createDiv({ cls: "samsyn-card" });
+      // A guest folder never reaches the home server, so a share around it always skips it.
+      const enclosing = enclosingShares(this.info, m.mountPath);
+      const insideText = enclosing.length ? ` · inside ${quoted(enclosing.map((s) => s.name))}: never shared onward as a guest mount` : "";
       new Setting(card)
         .setName(m.name)
         .setClass("samsyn-card-head")
-        .setDesc(`${m.mountPath} · ${accessText(m.access, m.rwPaths)} · guest of ${m.url.replace(/^https?:\/\//, "")} · ${status}`)
+        .setDesc(`${m.mountPath} · ${accessText(m.access, m.rwPaths)} · guest of ${m.url.replace(/^https?:\/\//, "")} · ${status}${insideText}`)
         .addButton((b) =>
           b.setButtonText("Move…").onClick(() =>
             new MoveMountModal(this.plugin, { kind: "guest", id: m.id, name: m.name, path: m.mountPath, isFile: false }, () => this.render()).open(),

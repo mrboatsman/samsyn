@@ -53,6 +53,10 @@ pub struct Bridge {
     /// a mount's comes from its ticket (read & write, read-only, or read-only with writable paths).
     pub access: Access,
     pub truth: Side,
+    /// Vault folders (full prefixes with trailing slash, inside `vault_prefix`) this bridge
+    /// leaves alone in both directions: mounts of other people's shares that the owner chose
+    /// not to carry onward with this share. Owner bridges only; always empty for mounts.
+    pub exclude: Vec<String>,
 }
 
 fn bridge_origin(src: &str) -> Origin {
@@ -62,13 +66,17 @@ fn bridge_origin(src: &str) -> Origin {
 }
 
 impl Bridge {
+    fn excluded(&self, vault_key: &str) -> bool {
+        self.exclude.iter().any(|p| vault_key.starts_with(p.as_str()))
+    }
+
     pub fn vault_to_share_key(&self, key: &str) -> Option<String> {
         if !valid_key(key) {
             tracing::warn!(share = %self.share_id, "refusing to bridge invalid key {key:?}");
             return None;
         }
         let rest = key.strip_prefix(self.vault_prefix.as_str())?;
-        if rest.is_empty() {
+        if rest.is_empty() || self.excluded(key) {
             return None;
         }
         match &self.only_file {
@@ -82,9 +90,33 @@ impl Bridge {
             tracing::warn!(share = %self.share_id, "refusing to bridge invalid key {key:?}");
             return None;
         }
-        match &self.only_file {
-            Some(f) if f != key => None,
-            _ => Some(format!("{}{}", self.vault_prefix, key)),
+        let vk = match &self.only_file {
+            Some(f) if f != key => return None,
+            _ => format!("{}{}", self.vault_prefix, key),
+        };
+        if self.excluded(&vk) {
+            return None;
+        }
+        Some(vk)
+    }
+
+    /// Remove everything under the vault folder `prefix` from the share document: the owner
+    /// stopped carrying a mount onward with this share, so its holders lose their copy. Only
+    /// meaningful on a bridge that does not (yet) exclude `prefix`.
+    pub fn drop_from_share(&self, prefix: &str) {
+        let Some(rel) = prefix.strip_prefix(self.vault_prefix.as_str()) else { return };
+        let aw = self.share.awareness.lock();
+        let doc = aw.doc().clone();
+        let mut txn = doc.transact_mut_with(bridge_origin(&self.vault.id));
+        let texts = txn.get_or_insert_map("texts");
+        let blobs = txn.get_or_insert_map("blobs");
+        let keys: Vec<String> = texts.keys(&txn).chain(blobs.keys(&txn)).filter(|k| k.starts_with(rel)).map(str::to_string).collect();
+        for k in &keys {
+            texts.remove(&mut txn, k);
+            blobs.remove(&mut txn, k);
+        }
+        if !keys.is_empty() {
+            tracing::info!(share = %self.share.label, "dropped {} key(s) under {prefix} no longer carried onward", keys.len());
         }
     }
 

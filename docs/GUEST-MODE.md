@@ -79,7 +79,7 @@ Home engine: identity mapping, `extraExcludes` = every guest mount root (so gues
 
 ### UI
 
-Sharing tab, *Shared with me* grows a second path: pasting a ticket whose URL is set offers **Mount as guest** (local folder, default `Shared/<name>`) next to the existing server mount. No home server configured → guest mount is the only option and the rest of the settings stay dormant. Overlap rules client-side: guest mount roots may not nest each other, the home excludes, or existing files (same "must be empty" rule as server mounts).
+Sharing tab, *Shared with me* grows a second path: pasting a ticket whose URL is set offers **Mount as guest** (local folder, default `Shared/<name>`) next to the existing server mount. No home server configured → guest mount is the only option and the rest of the settings stay dormant. Overlap rules client-side: guest mount roots may not nest each other or existing files (same "must be empty" rule as server mounts). A guest mount inside one of your own shares is fine and is never carried onward by it, since the home engine excludes the folder; the Sharing tab says so on the card.
 
 ## Many-to-many
 

@@ -214,6 +214,27 @@ impl LiveDoc {
     }
 }
 
+/// Two prefixes overlap when one contains the other (or they are equal).
+pub(crate) fn overlaps(a: &str, b: &str) -> bool {
+    a == b || a.starts_with(b) || b.starts_with(a)
+}
+
+/// Mount folders the owner bridge of `share` must leave alone: every mount row of the vault
+/// strictly inside the share whose owner did not opt into carrying it onward with this share.
+/// Revoked rows count too, until they are removed: a copy that stopped syncing is still other
+/// people's content and must not start flowing to the share's holders on its own.
+pub(crate) fn owner_excludes(reg: &crate::storage::Registry, share: &ShareInfo) -> anyhow::Result<Vec<String>> {
+    if share.only_file.is_some() {
+        return Ok(Vec::new());
+    }
+    Ok(reg
+        .mounts_for_vault(&share.vault_id)?
+        .into_iter()
+        .filter(|m| m.mount_prefix.starts_with(&share.prefix) && m.mount_prefix != share.prefix && !m.forward_shares.iter().any(|s| s == &share.id))
+        .map(|m| m.mount_prefix)
+        .collect())
+}
+
 fn origin_source(origin: Option<&yrs::Origin>) -> Option<String> {
     let o = origin?;
     let bytes: &[u8] = o.as_ref();
@@ -398,11 +419,57 @@ impl DocRegistry {
             only_file: share.only_file.clone(),
             access: Access::full(),
             truth: Side::Vault,
+            exclude: owner_excludes(self.storage.registry(), share)?,
         });
         bridge.reconcile();
         self.bridges.lock().push(bridge.clone());
         self.propagate(&bridge.share);
         Ok(())
+    }
+
+    /// Re-attach the owner bridges of every folder share of `vault` that overlaps one of the
+    /// `touching` prefixes, so their exclude lists match the registry again. Call after a
+    /// mount was created, moved, deleted or had its forwarding changed. A share whose exclude
+    /// list did not change is left alone; one that now skips a folder it used to carry first
+    /// drops that folder from its share document, so the holders lose their copy. Must be
+    /// called with `apply_lock` held.
+    fn refresh_owner_bridges_locked(&self, vault: &Arc<LiveDoc>, touching: &[String]) -> anyhow::Result<()> {
+        let reg = self.storage.registry();
+        for share in reg.shares_for_vault(&vault.id)? {
+            if share.only_file.is_some() || !touching.iter().any(|p| overlaps(&share.prefix, p)) {
+                continue;
+            }
+            let mut wanted = owner_excludes(reg, &share)?;
+            wanted.sort();
+            let old = {
+                let mut bridges = self.bridges.lock();
+                let pos = bridges.iter().position(|b| b.share_id == share.id && b.mount_id.is_none());
+                pos.map(|i| bridges.remove(i))
+            };
+            if let Some(old) = &old {
+                let mut have = old.exclude.clone();
+                have.sort();
+                if have == wanted {
+                    self.bridges.lock().push(old.clone());
+                    continue;
+                }
+                for p in wanted.iter().filter(|p| !old.exclude.contains(p)) {
+                    old.drop_from_share(p);
+                }
+            }
+            self.attach_owner_bridge_locked(vault, &share)?;
+        }
+        Ok(())
+    }
+
+    /// Public form of `refresh_owner_bridges_locked`: takes the apply lock. A vault that is
+    /// not loaded needs nothing, its bridges are built from the registry when it loads.
+    pub fn refresh_owner_bridges(&self, vault_id: &str, touching: &[String]) -> anyhow::Result<()> {
+        let _g = self.apply_lock.lock();
+        match self.loaded_vault(vault_id) {
+            Some(vault) => self.refresh_owner_bridges_locked(&vault, touching),
+            None => Ok(()),
+        }
     }
 
     fn attach_mount_bridge_locked(self: &Arc<Self>, vault: &Arc<LiveDoc>, mount: &MountInfo) -> anyhow::Result<()> {
@@ -425,6 +492,7 @@ impl DocRegistry {
             only_file,
             access: Access::new(&mount.access, &mount.rw_paths),
             truth: Side::Share,
+            exclude: Vec::new(),
         });
         bridge.reconcile();
         self.bridges.lock().push(bridge.clone());
@@ -462,9 +530,13 @@ impl DocRegistry {
         self.attach_owner_bridge_locked(&vault, share)
     }
 
+    /// Called by the API after creating or restoring a mount. The owner bridges around the
+    /// mount folder are refreshed first, so the share that should skip it does so before the
+    /// first key arrives, and the one that should carry it onward sees the reconcile.
     pub fn add_mount_bridge(self: &Arc<Self>, mount: &MountInfo) -> anyhow::Result<()> {
         let _g = self.apply_lock.lock();
         let vault = self.loaded_vault(&mount.vault_id).ok_or_else(|| anyhow::anyhow!("vault not loaded"))?;
+        self.refresh_owner_bridges_locked(&vault, std::slice::from_ref(&mount.mount_prefix))?;
         self.attach_mount_bridge_locked(&vault, mount)
     }
 
@@ -486,6 +558,25 @@ impl DocRegistry {
         let _g = self.apply_lock.lock();
         // Detach only this bridge; the share document and any link task stay as they are.
         self.bridges.lock().retain(|b| !(b.share_id == share_id && b.mount_id.as_deref() == mount_id));
+        // A moving mount must not leak through the owner bridges around it: a share that skips
+        // the mount at its old folder would mirror the keys appearing at the new one (and one
+        // that carries it would see a deletion before the registry knows the new folder). Park
+        // every folder share touching either end for the duration; re-attaching reconciles
+        // them against the vault, which by then holds the keys at the new place only.
+        let parked: Vec<ShareInfo> = if mount_id.is_some() {
+            let touching: Vec<ShareInfo> = self
+                .storage
+                .registry()
+                .shares_for_vault(vault_id)?
+                .into_iter()
+                .filter(|s| s.only_file.is_none() && (overlaps(&s.prefix, old_prefix) || overlaps(&s.prefix, new_prefix)))
+                .collect();
+            let ids: Vec<&str> = touching.iter().map(|s| s.id.as_str()).collect();
+            self.bridges.lock().retain(|b| !(b.mount_id.is_none() && ids.contains(&b.share_id.as_str())));
+            touching
+        } else {
+            Vec::new()
+        };
 
         let (old_root, new_root) = match (old_file, new_file) {
             (Some(of), Some(nf)) => (format!("{old_prefix}{of}"), format!("{new_prefix}{nf}")),
@@ -519,8 +610,8 @@ impl DocRegistry {
         };
         // The moved bridge is detached, so nothing from this transaction reaches its share.
         // Other bridges on this vault do see the renames: a share that contains the moved
-        // share must follow it, or its mounts go stale. A moved mount never overlaps another
-        // bridge, so for mounts this forwards nothing.
+        // share must follow it, or its mounts go stale. For a mount, the shares around it are
+        // parked, so this forwards nothing.
         self.propagate(&vault);
 
         let reg = self.storage.registry();
@@ -530,6 +621,11 @@ impl DocRegistry {
             // Re-attach with the new prefix (for remote mounts this restarts the link; the
             // replica document is untouched so nothing is re-downloaded).
             self.attach_mount_bridge_locked(&vault, &mount)?;
+            for s in parked {
+                if let Some(s) = reg.share_by_id(&s.id)? {
+                    self.attach_owner_bridge_locked(&vault, &s)?;
+                }
+            }
         } else {
             reg.update_share_path(share_id, new_prefix, new_file)?;
             let share = reg.share_by_id(share_id)?.ok_or_else(|| anyhow::anyhow!("share vanished"))?;

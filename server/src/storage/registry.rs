@@ -73,6 +73,10 @@ pub struct MountInfo {
     pub home_addrs: Vec<String>,
     /// Set when the share is a single note (remote mounts; local ones read it from the share).
     pub only_file: Option<String>,
+    /// Ids of this vault's own shares that enclose the mount folder and are allowed to carry
+    /// the mounted content onward to their holders. An enclosing share not listed here skips
+    /// the mount's subtree. Empty for mounts outside every share.
+    pub forward_shares: Vec<String>,
     #[serde(skip_serializing)]
     pub secret: String,
     pub created_at: String,
@@ -186,7 +190,8 @@ impl Registry {
                 home_node    TEXT NOT NULL,
                 secret       TEXT NOT NULL,
                 created_at   TEXT NOT NULL,
-                revoked_at   TEXT
+                revoked_at   TEXT,
+                forward_shares TEXT NOT NULL DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS mounts_vault ON mounts(vault_id);
             CREATE INDEX IF NOT EXISTS mounts_share ON mounts(share_id);
@@ -651,6 +656,7 @@ impl Registry {
         home_addrs: &[String],
         only_file: Option<&str>,
         secret: &str,
+        forward_shares: &[String],
     ) -> anyhow::Result<MountInfo> {
         let m = MountInfo {
             id: new_id(),
@@ -664,16 +670,23 @@ impl Registry {
             home_node: home_node.into(),
             home_addrs: home_addrs.to_vec(),
             only_file: only_file.map(str::to_string),
+            forward_shares: forward_shares.to_vec(),
             secret: secret.into(),
             created_at: Self::now(),
             revoked_at: None,
         };
         let conn = self.conn.lock();
         conn.execute(
-            "INSERT INTO mounts (id, user_id, vault_id, share_id, share_name, mount_prefix, access, home_node, home_addrs, only_file, secret, created_at, rw_paths) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-            params![m.id, m.user_id, m.vault_id, m.share_id, m.share_name, m.mount_prefix, m.access, m.home_node, m.home_addrs.join(" "), m.only_file, self.protect_secret(&m.secret), m.created_at, join_paths(&m.rw_paths)],
+            "INSERT INTO mounts (id, user_id, vault_id, share_id, share_name, mount_prefix, access, home_node, home_addrs, only_file, secret, created_at, rw_paths, forward_shares) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            params![m.id, m.user_id, m.vault_id, m.share_id, m.share_name, m.mount_prefix, m.access, m.home_node, m.home_addrs.join(" "), m.only_file, self.protect_secret(&m.secret), m.created_at, join_paths(&m.rw_paths), m.forward_shares.join(" ")],
         )?;
         Ok(m)
+    }
+
+    /// Replace the set of enclosing shares a mount's content is forwarded to.
+    pub fn update_mount_forward(&self, id: &str, forward_shares: &[String]) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        Ok(conn.execute("UPDATE mounts SET forward_shares = ?1 WHERE id = ?2", params![forward_shares.join(" "), id])? > 0)
     }
 
     /// Mark one mount revoked (used when the owner server denies our secret).
@@ -766,7 +779,7 @@ impl Registry {
 // bump REGISTRY_SCHEMA_VERSION together with the new step. See docs/STORAGE.md.
 
 /// Current registry schema version (`PRAGMA user_version` after all steps ran).
-pub const REGISTRY_SCHEMA_VERSION: u32 = 4;
+pub const REGISTRY_SCHEMA_VERSION: u32 = 5;
 
 fn migrate(conn: &Connection) -> anyhow::Result<()> {
     let mut version: u32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
@@ -836,6 +849,15 @@ fn migrate(conn: &Connection) -> anyhow::Result<()> {
         version = 4;
     }
 
+    if version < 5 {
+        // v5: a mount may sit inside one of the vault's own shares; this lists the shares that
+        // carry it onward (empty = the enclosing shares skip it).
+        if !has_column(conn, "mounts", "forward_shares")? {
+            conn.execute_batch("ALTER TABLE mounts ADD COLUMN forward_shares TEXT NOT NULL DEFAULT ''")?;
+        }
+        version = 5;
+    }
+
     if version > REGISTRY_SCHEMA_VERSION {
         anyhow::bail!(
             "registry.db schema is v{version} but this server only knows v{REGISTRY_SCHEMA_VERSION}; upgrade the server"
@@ -857,7 +879,7 @@ fn has_column(conn: &Connection, table: &str, column: &str) -> anyhow::Result<bo
 }
 
 const SHARE_COLS: &str = "SELECT id, user_id, vault_id, name, prefix, only_file, created_at FROM shares";
-const MOUNT_COLS: &str = "SELECT id, user_id, vault_id, share_id, share_name, mount_prefix, access, home_node, secret, created_at, revoked_at, home_addrs, only_file, rw_paths FROM mounts";
+const MOUNT_COLS: &str = "SELECT id, user_id, vault_id, share_id, share_name, mount_prefix, access, home_node, secret, created_at, revoked_at, home_addrs, only_file, rw_paths, forward_shares FROM mounts";
 
 /// `rw_paths` are stored newline-separated: keys pass `valid_key`, so they never contain one.
 fn join_paths(paths: &[String]) -> String {
@@ -896,6 +918,7 @@ fn row_to_mount(r: &rusqlite::Row) -> rusqlite::Result<MountInfo> {
         home_addrs: r.get::<_, String>(11)?.split_whitespace().map(str::to_string).collect(),
         only_file: r.get(12)?,
         rw_paths: split_paths(&r.get::<_, String>(13)?),
+        forward_shares: r.get::<_, String>(14)?.split_whitespace().map(str::to_string).collect(),
     })
 }
 
@@ -979,6 +1002,24 @@ mod migration_tests {
         let secret = reg.create_grant("s1", "mixed", "ro", &["Inbox/".to_string(), "todo.md".to_string()]).unwrap();
         let ga = reg.check_grant("s1", &secret).unwrap().unwrap();
         assert_eq!(ga.rw_paths, vec!["Inbox/", "todo.md"]);
+    }
+
+    #[test]
+    fn v4_db_gets_forward_shares_column() {
+        let (_d, reg) = open_with(
+            "CREATE TABLE users (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL);
+             CREATE TABLE vaults (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, name TEXT NOT NULL, created_at TEXT NOT NULL);
+             CREATE TABLE shares (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, vault_id TEXT NOT NULL, name TEXT NOT NULL, prefix TEXT NOT NULL, only_file TEXT, created_at TEXT NOT NULL);
+             CREATE TABLE share_grants (share_id TEXT NOT NULL, secret_hash TEXT NOT NULL, label TEXT NOT NULL, access TEXT NOT NULL, rw_paths TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, revoked_at TEXT, last_seen_at TEXT, PRIMARY KEY (share_id, label));
+             CREATE TABLE mounts (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, vault_id TEXT NOT NULL, share_id TEXT NOT NULL, share_name TEXT NOT NULL, mount_prefix TEXT NOT NULL, access TEXT NOT NULL, home_node TEXT NOT NULL, secret TEXT NOT NULL, created_at TEXT NOT NULL, revoked_at TEXT, home_addrs TEXT NOT NULL DEFAULT '', only_file TEXT, rw_paths TEXT NOT NULL DEFAULT '');
+             INSERT INTO mounts VALUES ('m1','u','v','s','S','Shared/S/','rw','node','sec','t',NULL,'',NULL,'');
+             PRAGMA user_version = 4;",
+        );
+        assert_eq!(user_version(&reg), REGISTRY_SCHEMA_VERSION);
+        let m = reg.mount_by_id("m1").unwrap().unwrap();
+        assert!(m.forward_shares.is_empty(), "old mounts forward nothing");
+        assert!(reg.update_mount_forward("m1", &["s1".to_string(), "s2".to_string()]).unwrap());
+        assert_eq!(reg.mount_by_id("m1").unwrap().unwrap().forward_shares, vec!["s1", "s2"]);
     }
 
     #[test]

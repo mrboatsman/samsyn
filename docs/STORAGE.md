@@ -46,7 +46,7 @@ Delete = remove the key. Rename = new key with a copy + remove old key; a folder
 
 ## Schema migrations
 
-`registry.db` carries its schema version in SQLite's `PRAGMA user_version` (`REGISTRY_SCHEMA_VERSION` in `server/src/storage/registry.rs`, currently 4: v3 added `share_grants.last_seen_at`, v4 added `rw_paths` on `share_grants` and `mounts`). On every open the server first creates any *missing* tables in their current shape, then runs the numbered steps in `migrate()` from the stored version up to the current one and records the new version. A database written by a newer server is refused with a clear error instead of being touched.
+`registry.db` carries its schema version in SQLite's `PRAGMA user_version` (`REGISTRY_SCHEMA_VERSION` in `server/src/storage/registry.rs`, currently 5: v3 added `share_grants.last_seen_at`, v4 added `rw_paths` on `share_grants` and `mounts`, v5 added `mounts.forward_shares`). On every open the server first creates any *missing* tables in their current shape, then runs the numbered steps in `migrate()` from the stored version up to the current one and records the new version. A database written by a newer server is refused with a clear error instead of being touched.
 
 Rules for changing the schema:
 

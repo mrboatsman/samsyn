@@ -1,5 +1,5 @@
 import { AbstractInputSuggest, App, Modal, Notice, Setting, TAbstractFile, TFolder } from "obsidian";
-import { SamsynApi, ShareRow, TicketInfo } from "./api";
+import { MountRow, SamsynApi, ShareRow, SharingInfo, TicketInfo } from "./api";
 import type SamsynPlugin from "./main";
 import type { SharedRoot } from "./main";
 import { mountLink, renderQr } from "./qr";
@@ -48,6 +48,56 @@ export const accessText = (a: string, rwPaths: string[] = []) =>
 /** A share's path for display: "" is the whole vault. */
 export const pathText = (p: string) => (p ? p : "the whole vault");
 
+/** My folder shares that strictly enclose `mountPath`: a mount there sits inside them, and
+ *  each one either carries the mounted content onward to its holders or skips it. */
+export function enclosingShares(info: SharingInfo | null, mountPath: string): ShareRow[] {
+  if (!info) return [];
+  const p = mountPath.trim().replace(/^\/+|\/+$/g, "");
+  if (!p) return [];
+  return info.shares.filter((s) => s.only_file === null && s.prefix !== p + "/" && (s.prefix === "" || (p + "/").startsWith(s.prefix)));
+}
+
+/** Active mounts strictly inside a prospective share at `path` ("" = the whole vault). */
+export function mountsInside(info: SharingInfo | null, path: string): MountRow[] {
+  if (!info) return [];
+  const p = path.trim().replace(/^\/+|\/+$/g, "");
+  return info.mounts.filter((m) => !m.status.startsWith("revoked") && (p === "" || m.mount_path.startsWith(p + "/")));
+}
+
+/** "“A”, “B”" for a list of names. */
+const quoted = (names: string[]) => names.map((n) => `“${n}”`).join(", ");
+
+/**
+ * The "carried onward?" block of the share and mount dialogs: one switch per overlap, off by
+ * default, since on means other people's content reaches people it was not shared with (or
+ * your share's holders get a folder you did not make). `chosen` holds the switched-on ids and
+ * is pruned to the items still shown.
+ */
+function renderForwardChoices(el: HTMLElement, chosen: Set<string>, intro: string, items: Array<{ id: string; name: string; desc: string }>, footnote?: string): void {
+  el.empty();
+  for (const id of [...chosen]) if (!items.some((i) => i.id === id)) chosen.delete(id);
+  if (items.length === 0) return;
+  el.createEl("p", { text: intro });
+  for (const it of items) {
+    new Setting(el)
+      .setName(it.name)
+      .setDesc(it.desc)
+      .addToggle((t) => t.setValue(chosen.has(it.id)).onChange((v) => (v ? chosen.add(it.id) : chosen.delete(it.id))));
+  }
+  if (footnote) el.createEl("p", { cls: "samsyn-muted samsyn-small", text: footnote });
+}
+
+/** Load the sharing listing for the overlap checks; null when there is no server or it fails. */
+async function loadSharing(api: SamsynApi, hasServer: boolean): Promise<SharingInfo | null> {
+  if (!hasServer) return null;
+  try {
+    return await api.sharing();
+  } catch (e) {
+    console.warn("[samsyn] could not load the sharing listing for the overlap check", e);
+    return null;
+  }
+}
+
 /** One path per line (or comma separated) from the writable-paths box. */
 function parsePaths(raw: string): string[] {
   return raw
@@ -95,6 +145,10 @@ export class ShareModal extends Modal {
   private name = "";
   private access = "rw";
   private rwPaths = "";
+  /** The sharing listing, for mounts inside the chosen path. */
+  private sharing: SharingInfo | null = null;
+  /** Mounts inside the path whose content the new share carries onward. */
+  private forward = new Set<string>();
 
   constructor(
     private plugin: SamsynPlugin,
@@ -112,15 +166,32 @@ export class ShareModal extends Modal {
     contentEl.createEl("h2", { text: "Share a folder or note" });
     contentEl.createEl("p", {
       cls: "samsyn-muted",
-      text: "Whoever gets the ticket sees exactly this path, live, in their own vault. Nothing else in your vault is visible to them. One ticket covers one path; share another path with another ticket. Sharing the whole vault leaves no room for other shares in it.",
+      text: "Whoever gets the ticket sees exactly this path, live, in their own vault. Nothing else in your vault is visible to them. One ticket covers one path; share another path with another ticket.",
     });
     let pathInput: import("obsidian").TextComponent | null = null;
+    let forwardEl: HTMLElement | null = null;
+    const updateForward = () => {
+      if (!forwardEl) return;
+      const inside = mountsInside(this.sharing, this.wholeVault ? "" : this.path);
+      renderForwardChoices(
+        forwardEl,
+        this.forward,
+        `${this.wholeVault ? "Your vault" : "This folder"} contains ${inside.length === 1 ? "a folder" : "folders"} other people share with you. Each stays out of the new share unless you switch it on; switched on, whoever holds a ticket for this share sees it too.`,
+        inside.map((m) => ({ id: m.id, name: m.name, desc: `${m.mount_path} · shared with you, ${accessText(m.access, m.rw_paths)}` })),
+        "Folders you mount as a guest never travel onward; mount via your server to get the choice.",
+      );
+    };
     new Setting(contentEl)
       .setName("Folder or note")
       .setDesc("A path in this vault, e.g. Projects/X or Notes/plan.md")
       .addText((t) => {
         pathInput = t;
-        t.setPlaceholder("Projects/X").setValue(this.path).onChange((v) => (this.path = v));
+        t.setPlaceholder("Projects/X")
+          .setValue(this.path)
+          .onChange((v) => {
+            this.path = v;
+            updateForward();
+          });
         t.inputEl.addClass("samsyn-wide");
         new PathSuggest(this.app, t.inputEl);
       });
@@ -131,8 +202,14 @@ export class ShareModal extends Modal {
         t.setValue(this.wholeVault).onChange((v) => {
           this.wholeVault = v;
           pathInput?.setDisabled(v);
+          updateForward();
         }),
       );
+    forwardEl = contentEl.createDiv({ cls: "samsyn-forward" });
+    void loadSharing(this.api, true).then((info) => {
+      this.sharing = info;
+      updateForward();
+    });
     new Setting(contentEl)
       .setName("Name")
       .setDesc("How the other person sees it. Defaults to the folder, note or vault name.")
@@ -163,13 +240,15 @@ export class ShareModal extends Modal {
           const rwPaths = this.access === "ro" ? parsePaths(this.rwPaths) : [];
           b.setDisabled(true);
           try {
-            const r = await this.api.createShare(p, this.name.trim(), this.access, rwPaths);
+            const r = await this.api.createShare(p, this.name.trim(), this.access, rwPaths, [...this.forward]);
             this.onDone?.();
+            const skipped = mountsInside(this.sharing, p).filter((m) => !this.forward.has(m.id));
             renderTicket(
               contentEl,
               r.ticket,
               `Sharing ${pathText(r.path ?? p)}`,
-              `Send this ticket (${accessText(r.access ?? this.access, r.rw_paths ?? rwPaths)}) to the person you want to work with. It is shown once; you can always create a new one.`,
+              `Send this ticket (${accessText(r.access ?? this.access, r.rw_paths ?? rwPaths)}) to the person you want to work with. It is shown once; you can always create a new one.` +
+                (skipped.length ? ` ${quoted(skipped.map((m) => m.name))} ${skipped.length === 1 ? "stays" : "stay"} out of this share.` : ""),
             );
           } catch (e) {
             msg.setText((e as Error).message);
@@ -257,6 +336,10 @@ export class MountModal extends Modal {
   private info: TicketInfo | null = null;
   private local: Ticket | null = null;
   private inspectTimer: ReturnType<typeof setTimeout> | null = null;
+  /** The sharing listing, for shares that enclose the chosen folder. */
+  private sharing: SharingInfo | null = null;
+  /** Enclosing shares that carry the mounted content onward to their holders. */
+  private forward = new Set<string>();
 
   constructor(
     private plugin: SamsynPlugin,
@@ -278,12 +361,35 @@ export class MountModal extends Modal {
     const card = contentEl.createDiv({ cls: "samsyn-ticket-info" });
     const pathSetting = new Setting(contentEl).setName("Put it in").setDesc("A new or empty folder in this vault.");
     let pathInput: HTMLInputElement | null = null;
+    const hasServer = !!(this.plugin.settings.serverUrl && this.plugin.settings.token);
+    let forwardEl: HTMLElement | null = null;
+    const updateForward = () => {
+      if (!forwardEl) return;
+      const enclosing = enclosingShares(this.sharing, this.mountPath);
+      renderForwardChoices(
+        forwardEl,
+        this.forward,
+        `This folder is inside what you share. The people holding tickets for ${enclosing.length === 1 ? "that share" : "those shares"} do not see it unless you switch the share on here; switched on, it reaches them like the rest of the share.`,
+        enclosing.map((s) => {
+          const tickets = s.grants.filter((g) => !g.revoked_at).length;
+          return { id: s.id, name: s.name, desc: `${pathText(s.path)} · ${tickets} active ticket${tickets === 1 ? "" : "s"} · mounted by ${s.mounted_by}` };
+        }),
+        "Mounted as guest, the folder never travels onward; this choice applies to “Mount via my server”.",
+      );
+    };
     pathSetting.addText((t) => {
-      t.setPlaceholder("Shared/Name").onChange((v) => (this.mountPath = v));
+      t.setPlaceholder("Shared/Name").onChange((v) => {
+        this.mountPath = v;
+        updateForward();
+      });
       pathInput = t.inputEl;
     });
+    forwardEl = contentEl.createDiv({ cls: "samsyn-forward" });
+    void loadSharing(this.api, hasServer).then((info) => {
+      this.sharing = info;
+      updateForward();
+    });
     const msg = contentEl.createDiv({ cls: "samsyn-error" });
-    const hasServer = !!(this.plugin.settings.serverUrl && this.plugin.settings.token);
     let serverBtn: import("obsidian").ButtonComponent | null = null;
     let guestBtn: import("obsidian").ButtonComponent | null = null;
     const buttons = new Setting(contentEl);
@@ -296,8 +402,10 @@ export class MountModal extends Modal {
           .onClick(async () => {
             b.setDisabled(true);
             try {
-              const r = await this.api.mount(this.ticket.trim(), this.mountPath.trim());
-              new Notice(`Samsyn: mounted at ${r.mount_path} (${accessText(r.access, r.rw_paths)}). Files arrive shortly.`, 8000);
+              const r = await this.api.mount(this.ticket.trim(), this.mountPath.trim(), [...this.forward]);
+              const skipped = enclosingShares(this.sharing, r.mount_path).filter((s) => !r.forward_shares?.includes(s.id));
+              const onward = skipped.length ? ` Kept out of ${quoted(skipped.map((s) => s.name))}.` : r.forward_shares?.length ? " Shared onward as chosen." : "";
+              new Notice(`Samsyn: mounted at ${r.mount_path} (${accessText(r.access, r.rw_paths)}). Files arrive shortly.${onward}`, 8000);
               this.onDone?.();
               this.close();
             } catch (e) {
@@ -359,6 +467,7 @@ export class MountModal extends Modal {
       if (!this.mountPath.trim() && pathInput) {
         this.mountPath = `Shared/${local.name}`;
         pathInput.value = this.mountPath;
+        updateForward();
       }
       if (local.url) {
         const insecure = local.url.startsWith("http://") && (this.app as any).isMobile;
@@ -438,6 +547,64 @@ export class MountModal extends Modal {
 
   onClose(): void {
     if (this.inspectTimer) clearTimeout(this.inspectTimer);
+    this.contentEl.empty();
+  }
+}
+
+/** Change which of the shares around a mount carry its content onward to their holders. */
+export class ForwardModal extends Modal {
+  private api: SamsynApi;
+  private chosen: Set<string>;
+
+  constructor(
+    private plugin: SamsynPlugin,
+    private mount: MountRow,
+    private enclosing: ShareRow[],
+    private onDone?: () => void,
+  ) {
+    super(plugin.app);
+    this.api = new SamsynApi(plugin.settings);
+    this.chosen = new Set(mount.forward_shares ?? []);
+  }
+
+  onOpen(): void {
+    const { contentEl } = this;
+    contentEl.addClass("samsyn-modal");
+    contentEl.createEl("h2", { text: `Share “${this.mount.name}” onward?` });
+    const block = contentEl.createDiv({ cls: "samsyn-forward" });
+    renderForwardChoices(
+      block,
+      this.chosen,
+      `${this.mount.mount_path} is inside what you share. Switched on, the people holding tickets for that share see this folder too and it follows their edits; switched off, their copy of it is removed and nothing from it reaches them.`,
+      this.enclosing.map((s) => {
+        const tickets = s.grants.filter((g) => !g.revoked_at).length;
+        return { id: s.id, name: s.name, desc: `${pathText(s.path)} · ${tickets} active ticket${tickets === 1 ? "" : "s"} · mounted by ${s.mounted_by}` };
+      }),
+    );
+    const msg = contentEl.createDiv({ cls: "samsyn-error" });
+    new Setting(contentEl)
+      .addButton((b) => b.setButtonText("Cancel").onClick(() => this.close()))
+      .addButton((b) =>
+        b
+          .setButtonText("Save")
+          .setCta()
+          .onClick(async () => {
+            b.setDisabled(true);
+            try {
+              const r = await this.api.setMountForward(this.mount.id, [...this.chosen]);
+              const names = this.enclosing.filter((s) => r.forward_shares.includes(s.id)).map((s) => s.name);
+              new Notice(names.length ? `Samsyn: “${this.mount.name}” is now shared onward with ${quoted(names)}.` : `Samsyn: “${this.mount.name}” is no longer shared onward.`, 8000);
+              this.onDone?.();
+              this.close();
+            } catch (e) {
+              msg.setText((e as Error).message);
+              b.setDisabled(false);
+            }
+          }),
+      );
+  }
+
+  onClose(): void {
     this.contentEl.empty();
   }
 }

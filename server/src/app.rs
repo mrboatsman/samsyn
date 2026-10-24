@@ -121,6 +121,7 @@ pub async fn serve(args: ServeArgs, storage: Storage) -> anyhow::Result<()> {
         .route("/api/shares/{id}/grants/{label}/restore", post(sharing::restore_ticket))
         .route("/api/vaults/{vault}/mounts", post(sharing::create_mount))
         .route("/api/mounts/{id}", delete(sharing::delete_mount).patch(sharing::move_mount))
+        .route("/api/mounts/{id}/forward", put(sharing::set_mount_forward))
         .route("/api/tickets/inspect", post(sharing::inspect_ticket))
         .route("/api/me/tokens", get(account::list_tokens).post(account::create_token))
         .route("/api/me/tokens/{label}", delete(account::revoke_token))

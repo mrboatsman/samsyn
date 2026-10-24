@@ -74,8 +74,9 @@ nothing is lost.
   note, anything else becomes a folder entry with a trailing `/`, so a folder that
   does not exist yet can be made writable in advance.
 - **Mount**: `{ id, user, vault, share, mount_prefix, access, rw_paths, home_node,
-  home_addrs, only_file, secret }`. A mount bridges the share into the friend's
-  vault at `mount_prefix`. `home_node` is the owner's server; when it equals this
+  home_addrs, only_file, secret, forward_shares }`. A mount bridges the share into
+  the friend's vault at `mount_prefix`. `forward_shares` names the friend's own
+  shares that enclose the mount and carry it onward (see the overlap rules below). `home_node` is the owner's server; when it equals this
   server the share is local (two users on one server) and no network is involved.
   Otherwise the server keeps a local *replica* of the share document and links it
   to the owner's server.
@@ -94,11 +95,24 @@ hub, every bridge sees each change once and the echo filter stops loops, so an
 edit through the inner share reaches the outer share's mounts and vice versa. Two
 shares may not have the same path (issue another ticket instead), and a share
 containing other shares cannot be moved (move or unshare the inner ones first).
-Mounts are stricter: a mount never overlaps a share or another mount, since it is
-content other people share with us and must not be shared onward. A mount prefix
-must be empty in the vault when mounted, so nothing is overwritten. Share and
-mount creation run under one server-wide lock (overlap check, registry insert,
-bridge attach), so two concurrent requests cannot both pass the overlap check.
+Mounts are stricter, since they are content other people share with us: nothing
+can be shared from inside a mount (share it from the owner instead), mounts never
+overlap each other, and a mount never sits *on* a shared folder. A mount may sit
+strictly *inside* a folder or whole-vault share, though, so a vault shared in full
+can still take in someone else's folder. For each such enclosing share the owner
+decides whether it carries the mounted content onward to its holders
+(`forward_shares` on the mount, chosen when mounting, when creating a share
+around an existing mount, or later via *Onward…*). The default is no: the
+share's bridge then skips the mount's subtree in both directions, exactly as if
+the folder were not there. Switching a share on copies the folder into its share
+document (and so to its mounts); switching it off again deletes it there. Revoked
+mounts keep their folder out of the enclosing shares until they are removed from
+the list; an unmounted or removed folder is ordinary notes and flows like the rest
+of the vault (the UI says so before unmounting). Guest mounts never reach the home
+server, so an enclosing share always skips them. A mount prefix must be empty in
+the vault when mounted, so nothing is overwritten. Share and mount creation run
+under one server-wide lock (overlap check, registry insert, bridge attach), so two
+concurrent requests cannot both pass the overlap check.
 
 ## Storage
 
@@ -224,7 +238,13 @@ so); only a real grant denial revokes the mount.
   to be re-mounted) or **deleted** from the list.
 - **Unshare**: bridge removed, share document deleted, owner's files untouched;
   all mounts of it go inert.
-- **Unmount**: bridge removed, friend's files stay.
+- **Unmount**: bridge removed, friend's files stay. Shares around the mount that
+  skipped it are re-attached and now carry the leftover notes like any others.
+- **Moving a mount** that sits inside shares: the owner bridges touching the old
+  or new folder are detached for the rename and re-attached afterwards, so a
+  share that skips the mount never sees the keys appear at the new place. The
+  forwarding choice follows the mount while it stays inside a share and lapses
+  when it leaves; a share it moves into starts out skipping it.
 
 ## Guests (no server of their own)
 
@@ -269,19 +289,20 @@ connection stamps `last_seen_at` on its ticket, shown to the owner.
 | Method | Path | Body → Result |
 |---|---|---|
 | GET | `/api/vaults/{vault}/sharing` | → node_id, shares (with grants), mounts |
-| POST | `/api/vaults/{vault}/shares` | `{path, name?, access?, rw_paths?}` → share + first ticket; `path: ""` shares the whole vault |
+| POST | `/api/vaults/{vault}/shares` | `{path, name?, access?, rw_paths?, forward_mounts?}` → share + first ticket; `path: ""` shares the whole vault; `forward_mounts` lists mounts inside the path the share carries onward (others are skipped) |
 | POST | `/api/shares/{id}/tickets` | `{label?, access?, rw_paths?}` → ticket (`rw_paths` only with `access: "ro"`) |
 | DELETE | `/api/shares/{id}/grants/{label}` | revoke; on an already revoked ticket: delete it from the list |
 | POST | `/api/shares/{id}/grants/{label}/restore` | un-revoke: same ticket valid again, local mounts re-attached (remote mounts must be mounted again) |
 | DELETE | `/api/shares/{id}` | unshare |
-| POST | `/api/vaults/{vault}/mounts` | `{ticket, mount_path}` → mount |
+| POST | `/api/vaults/{vault}/mounts` | `{ticket, mount_path, forward_shares?}` → mount; `forward_shares` lists the enclosing shares that carry it onward (others skip it) |
 | PATCH | `/api/mounts/{id}` | `{path}` → move the mount to another folder (keys renamed server-side, nothing deleted) |
+| PUT | `/api/mounts/{id}/forward` | `{share_ids}` → replace the set of enclosing shares that carry the mount onward |
 | PATCH | `/api/shares/{id}` | `{path}` → move the shared folder or note within the owner's vault (not for whole-vault shares) |
 | DELETE | `/api/mounts/{id}` | unmount |
 | POST | `/api/tickets/inspect` | `{ticket}` → name, access, rw_paths, same_server, valid (local tickets), from_own_vault |
 
-Grants and mounts in the `sharing` listing carry `rw_paths` too; a whole-vault
-share has `path: ""`.
+Grants and mounts in the `sharing` listing carry `rw_paths` too, mounts also
+`forward_shares`; a whole-vault share has `path: ""`.
 
 ## Plugin UI
 
@@ -302,4 +323,6 @@ the replica), `presence-e2e.sh` (presence across the bridge) and `guest-e2e.sh`
 (guest mount, reconnect). The same scenarios run as Rust integration tests under
 `server/tests/` (`sharing_same_server.rs`, `sharing_remote.rs`,
 `sharing_guest.rs`), plus `sharing_mixed.rs` (whole-vault share, read-only ticket
-with writable paths, restart).
+with writable paths, restart) and `sharing_nested_mount.rs` (a mount inside a
+whole-vault share: skipped by default, carried onward on request, toggled, moved,
+restarted, unmounted).
